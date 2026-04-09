@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(tree -L 3 /Users/jakeyoon/coding/ollama-chatbot --ignore='node_modules|venv|.next|.git')"
-    ]
-  }
-}

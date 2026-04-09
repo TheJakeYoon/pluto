@@ -139,6 +139,25 @@ body {
   border-bottom-left-radius: 4px;
 }
 
+/* KaTeX (remark-math + rehype-katex) in chat bubbles */
+.message-bubble .katex {
+  font-size: 1.05em;
+  color: inherit;
+}
+
+.message-bubble .katex-display {
+  display: block;
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+}
+
+.message-bubble .katex-display > .katex {
+  white-space: nowrap;
+}
+
 .error-message {
   align-self: center;
   background: var(--error-bg);
