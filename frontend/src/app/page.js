@@ -1,8 +1,40 @@
 "use client";
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+
+/**
+ * LLMs often emit LaTeX without proper $ / $$ delimiters. Normalize before remark-math.
+ */
+function preprocessMathForMarkdown(text) {
+  if (!text || typeof text !== 'string') return text;
+  let t = text;
+  // LaTeX display \[ ... \]
+  t = t.replace(/\\\[([\s\S]*?)\\\]/g, (_, inner) => `\n\n$$\n${inner.trim()}\n$$\n\n`);
+  // LaTeX inline \( ... \)
+  t = t.replace(/\\\(([\s\S]*?)\\\)/g, (_, inner) => `$${inner.trim()}$`);
+  // Display block: [ ... ] on its own lines with TeX inside (e.g. [\n\sum_{...}\n])
+  // Display block: newline, [, newline, TeX lines, newline, ] (common LLM output)
+  t = t.replace(/\n\[\s*\n([\s\S]*?)\n\]/g, (match, inner) => {
+    const trimmed = inner.trim();
+    if (/\\[a-zA-Z]/.test(trimmed)) {
+      return `\n\n$$\n${trimmed}\n$$\n\n`;
+    }
+    return match;
+  });
+  // Same when [ starts the message
+  t = t.replace(/^\[\s*\n([\s\S]*?)\n\]/m, (match, inner) => {
+    const trimmed = inner.trim();
+    if (/\\[a-zA-Z]/.test(trimmed)) {
+      return `$$\n${trimmed}\n$$\n\n`;
+    }
+    return match;
+  });
+  return t;
+}
 
 const CLOUD_MODELS = {
   openai: [
@@ -47,6 +79,22 @@ const PROVIDER_LABELS = {
   google: 'Google',
 };
 
+const LOCAL_OLLAMA_MODEL_OPTIONS = [
+  'gpt-oss:20b',
+  'qwen3.5:27b',
+];
+
+function mergeUniqueModelNames(...groups) {
+  const out = [];
+  for (const group of groups) {
+    for (const name of group || []) {
+      if (!name || out.includes(name)) continue;
+      out.push(name);
+    }
+  }
+  return out;
+}
+
 export default function Home() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -54,9 +102,8 @@ export default function Home() {
   const [error, setError] = useState(null);
   const [models, setModels] = useState([]);
   const [loadedModels, setLoadedModels] = useState([]);
-  const [selectedModel, setSelectedModel] = useState('gemma3:1b');
-  const [manageModel, setManageModel] = useState('gemma3:1b');
-  const [sysMem, setSysMem] = useState(null);
+  const [selectedModel, setSelectedModel] = useState('gpt-oss:20b');
+  const [manageModel, setManageModel] = useState('gpt-oss:20b');
   const [isManageModalOpen, setIsManageModalOpen] = useState(false);
 
   // Cloud provider state
@@ -92,6 +139,9 @@ export default function Home() {
   const [autoScroll, setAutoScroll] = useState(true);
   const endOfMessagesRef = useRef(null);
   const chatHistoryRef = useRef(null);
+  const lastScrollTopRef = useRef(0);
+  const currentRequestControllerRef = useRef(null);
+  const localModelOptions = mergeUniqueModelNames(LOCAL_OLLAMA_MODEL_OPTIONS, models);
 
   // Load API keys from localStorage
   useEffect(() => {
@@ -157,56 +207,41 @@ export default function Home() {
     }
   }, [isManageModalOpen, settingsTab]);
 
-  useEffect(() => {
-    const fetchModels = () => {
-      fetch('http://localhost:8000/api/models')
-        .then(r => r.json())
-        .then(data => {
-          if (data.models && data.models.length > 0) {
-            setModels(data.models);
-            setManageModel(prev => prev && data.models.includes(prev) ? prev : data.models[0]);
-          }
-        })
-        .catch(err => console.error("Error fetching models:", err));
+  const refreshOllamaModelState = useCallback(() => {
+    fetch('http://localhost:8000/api/models')
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data.models)) {
+          const merged = mergeUniqueModelNames(LOCAL_OLLAMA_MODEL_OPTIONS, data.models);
+          setModels(merged);
+          setManageModel(prev => prev && merged.includes(prev) ? prev : merged[0]);
+        }
+      })
+      .catch(err => console.error("Error fetching models:", err));
 
-      fetch('http://localhost:8000/api/models/loaded')
-        .then(r => r.json())
-        .then(data => {
-          if (data.models) {
-            setLoadedModels(data.models);
-            setSelectedModel(prev => {
-              if (data.models.includes(prev)) return prev;
-              return data.models.length > 0 ? data.models[0] : (prev || 'gemma3:1b');
-            });
-          }
-        })
-        .catch(err => console.error("Error fetching loaded models:", err));
-    };
-
-    const fetchMem = () => {
-      fetch('http://localhost:8000/api/sysinfo')
-        .then(r => r.json())
-        .then(data => {
-          if (data.memory) {
-            setSysMem({
-              percent: data.memory.percent,
-              usedGb: (data.memory.used / (1024 ** 3)).toFixed(1),
-              totalGb: (data.memory.total / (1024 ** 3)).toFixed(1)
-            });
-          }
-        })
-        .catch(err => console.error("Error fetching sysinfo:", err));
-    };
-
-    fetchModels();
-    fetchMem();
-    const intervalModels = setInterval(fetchModels, 5000);
-    const intervalMem = setInterval(fetchMem, 5000);
-    return () => {
-      clearInterval(intervalModels);
-      clearInterval(intervalMem);
-    };
+    fetch('http://localhost:8000/api/models/loaded')
+      .then(r => r.json())
+      .then(data => {
+        if (data.models) {
+          setLoadedModels(data.models);
+          setSelectedModel(prev => {
+            if (data.models.includes(prev)) return prev;
+            return data.models.length > 0 ? data.models[0] : (prev || 'gpt-oss:20b');
+          });
+        }
+      })
+      .catch(err => console.error("Error fetching loaded models:", err));
   }, []);
+
+  useEffect(() => {
+    refreshOllamaModelState();
+  }, [refreshOllamaModelState]);
+
+  useEffect(() => {
+    if (isManageModalOpen && settingsTab === 'local') {
+      refreshOllamaModelState();
+    }
+  }, [isManageModalOpen, settingsTab, refreshOllamaModelState]);
 
   const handleStopModel = async () => {
     if (!manageModel) return;
@@ -218,6 +253,7 @@ export default function Home() {
       });
       if (!response.ok) throw new Error("Failed to stop model");
       alert(`Model ${manageModel} stopped successfully`);
+      refreshOllamaModelState();
     } catch (err) {
       alert(err.message);
     }
@@ -233,6 +269,7 @@ export default function Home() {
       });
       if (!response.ok) throw new Error("Failed to load model");
       alert(`Model ${manageModel} loaded successfully`);
+      refreshOllamaModelState();
     } catch (err) {
       alert(err.message);
     }
@@ -247,13 +284,25 @@ export default function Home() {
 
   const currentModelName = provider === 'ollama' ? selectedModel : cloudModels[provider];
 
+  const handleStopStreaming = () => {
+    if (currentRequestControllerRef.current) {
+      currentRequestControllerRef.current.abort();
+      currentRequestControllerRef.current = null;
+    }
+    setIsLoading(false);
+  };
+
   const handleSend = async (e) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    if (isLoading) {
+      handleStopStreaming();
+      return;
+    }
+    if (!input.trim()) return;
 
-    // Validate API key for cloud providers
-    if (provider !== 'ollama' && !apiKeys[provider]) {
-      setError(`Please set your ${PROVIDER_LABELS[provider]} API key in Settings → Cloud API Keys.`);
+    // Google still uses the browser-stored key on /api/cloud/chat; OpenAI/Anthropic use server .env.local via /api/chat.
+    if (provider === 'google' && !apiKeys[provider]) {
+      setError(`Please set your ${PROVIDER_LABELS.google} API key in Settings → Cloud API Keys.`);
       return;
     }
 
@@ -265,6 +314,9 @@ export default function Home() {
     setIsLoading(true);
     setError(null);
 
+    const controller = new AbortController();
+    currentRequestControllerRef.current = controller;
+
     try {
       let response;
 
@@ -272,16 +324,32 @@ export default function Home() {
         response = await fetch('http://localhost:8000/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({
             model: selectedModel,
             messages: newMessages,
             thread_id: threadId,
+            stream: true,
+          }),
+        });
+      } else if (provider === 'openai' || provider === 'anthropic') {
+        response = await fetch('http://localhost:8000/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            cloud: true,
+            model: cloudModels[provider],
+            messages: newMessages,
+            thread_id: threadId,
+            stream: true,
           }),
         });
       } else {
         response = await fetch('http://localhost:8000/api/cloud/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({
             provider,
             model: cloudModels[provider],
@@ -305,35 +373,52 @@ export default function Home() {
         return;
       }
 
-      // Prepare an empty assistant message
-      setMessages((prev) => [...prev, { role: 'assistant', content: '' }]);
+      const contentType = response.headers.get('content-type') || '';
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder('utf-8');
+      if (contentType.includes('application/json')) {
+        const data = await response.json();
+        const content =
+          typeof data?.message?.content === 'string' ? data.message.content : '';
+        setMessages((prev) => [...prev, { role: 'assistant', content }]);
+      } else {
+        // Default: incremental plain-text stream (Ollama, cloud via /api/chat, Google /api/cloud/chat)
+        setMessages((prev) => [...prev, { role: 'assistant', content: '' }]);
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
 
-        const textChunk = decoder.decode(value, { stream: true });
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
 
-        setMessages((prev) => {
-          const allExceptLast = prev.slice(0, prev.length - 1);
-          const lastMsg = prev[prev.length - 1];
-          return [
-            ...allExceptLast,
-            { ...lastMsg, content: lastMsg.content + textChunk }
-          ];
-        });
+          const textChunk = decoder.decode(value, { stream: true });
+
+          setMessages((prev) => {
+            const allExceptLast = prev.slice(0, prev.length - 1);
+            const lastMsg = prev[prev.length - 1];
+            return [
+              ...allExceptLast,
+              { ...lastMsg, content: lastMsg.content + textChunk },
+            ];
+          });
+        }
       }
     } catch (err) {
+      if (err?.name === 'AbortError') {
+        return;
+      }
       console.error(err);
       setError(
         provider === 'ollama'
           ? "Failed to communicate with the backend. Ensure it is running."
-          : `Failed to get response from ${PROVIDER_LABELS[provider]}. Check your API key and model.`
+          : provider === 'google'
+            ? `Failed to get response from ${PROVIDER_LABELS[provider]}. Check your API key and model.`
+            : `Failed to get response from ${PROVIDER_LABELS[provider]}. Ensure OPENAI_API_KEY or ANTHROPIC_API_KEY is set in backend .env.local and the model id is valid.`
       );
     } finally {
+      if (currentRequestControllerRef.current === controller) {
+        currentRequestControllerRef.current = null;
+      }
       setIsLoading(false);
     }
   };
@@ -351,12 +436,6 @@ export default function Home() {
         {/* Header */}
         <header className="header" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', position: 'relative' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            {sysMem !== null ? (
-              <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', position: 'absolute', top: '10px', left: '15px' }}>
-                Mem: {sysMem.percent}%
-              </span>
-            ) : <span />}
-
             <div className="header-title" style={{ flex: 1, textAlign: 'center' }}>
               <span>✨</span> Ollama Chat
             </div>
@@ -379,7 +458,10 @@ export default function Home() {
               {Object.entries(PROVIDER_LABELS).map(([key, label]) => (
                 <button
                   key={key}
-                  onClick={() => setProvider(key)}
+                  onClick={() => {
+                    setProvider(key);
+                    if (key === 'ollama') refreshOllamaModelState();
+                  }}
                   className={`provider-tab ${provider === key ? 'active' : ''}`}
                 >
                   {label}
@@ -421,8 +503,8 @@ export default function Home() {
                   {CLOUD_MODELS[provider].map(m => <option key={m} value={m}>{m}</option>)}
                 </select>
               )}
-              {/* Show warning dot if cloud provider has no API key */}
-              {provider !== 'ollama' && !apiKeys[provider] && (
+              {/* Google requires a browser API key; OpenAI/Anthropic use server .env.local */}
+              {provider === 'google' && !apiKeys[provider] && (
                 <span title="API key not set" style={{ color: '#ef4444', fontSize: '0.7rem', cursor: 'help' }}>⚠</span>
               )}
             </div>
@@ -436,9 +518,15 @@ export default function Home() {
           onScroll={() => {
             const el = chatHistoryRef.current;
             if (!el) return;
-            const threshold = 40; // px from bottom to still consider "at bottom"
-            const isAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - threshold;
-            setAutoScroll(isAtBottom);
+            const currentTop = el.scrollTop;
+            const isAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
+            const isScrollingUp = currentTop < lastScrollTopRef.current;
+            if (isAtBottom) {
+              setAutoScroll(true);
+            } else if (isScrollingUp) {
+              setAutoScroll(false);
+            }
+            lastScrollTopRef.current = currentTop;
           }}
         >
           {messages.length === 0 && (
@@ -456,7 +544,8 @@ export default function Home() {
             <div key={index} className={`message-wrapper ${msg.role === 'user' ? 'user' : 'bot'}`}>
               <div className="message-bubble">
                 <ReactMarkdown
-                  remarkPlugins={[remarkGfm]}
+                  remarkPlugins={[remarkGfm, remarkMath]}
+                  rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
                   components={{
                     p: ({ children }) => (
                       <p style={{ margin: '0.3rem 0' }}>
@@ -485,7 +574,7 @@ export default function Home() {
                     ),
                   }}
                 >
-                  {msg.content}
+                  {preprocessMathForMarkdown(msg.content)}
                 </ReactMarkdown>
               </div>
             </div>
@@ -523,13 +612,19 @@ export default function Home() {
             <button
               type="submit"
               className="send-button"
-              disabled={!input.trim() || isLoading}
-              aria-label="Send Message"
+              disabled={!isLoading && !input.trim()}
+              aria-label={isLoading ? "Stop response" : "Send Message"}
             >
-              <svg className="send-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
+              {isLoading ? (
+                <svg className="send-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                  <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+                </svg>
+              ) : (
+                <svg className="send-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              )}
             </button>
           </form>
         </div>
@@ -595,8 +690,8 @@ export default function Home() {
                     className="chat-input"
                     style={{ cursor: 'pointer', padding: '0.5rem' }}
                   >
-                    {models.length === 0 && <option value="none">No models available</option>}
-                    {models.map(m => <option key={m} value={m}>{m}</option>)}
+                    {localModelOptions.length === 0 && <option value="none">No models available</option>}
+                    {localModelOptions.map(m => <option key={m} value={m}>{m}</option>)}
                   </select>
                 </div>
 
@@ -639,7 +734,10 @@ export default function Home() {
             {settingsTab === 'cloud' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                 <p className="settings-helper-text">
-                  API keys are stored locally in your browser and sent to the backend only when chatting.
+                  In-app OpenAI and Anthropic chat uses <code style={{ fontSize: '0.8em' }}>OPENAI_API_KEY</code> and{' '}
+                  <code style={{ fontSize: '0.8em' }}>ANTHROPIC_API_KEY</code> in the backend{' '}
+                  <code style={{ fontSize: '0.8em' }}>.env.local</code>. Keys below are for Google (required) and optional use with{' '}
+                  <code style={{ fontSize: '0.8em' }}>/api/cloud/chat</code>.
                 </p>
 
                 {['openai', 'anthropic', 'google'].map(prov => (
@@ -647,7 +745,7 @@ export default function Home() {
                     <label style={{ fontSize: '0.9rem', fontWeight: '500', color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                       {PROVIDER_LABELS[prov]}
                       {apiKeys[prov] && (
-                        <span style={{ fontSize: '0.7rem', color: '#10b981', fontWeight: '400' }}>Connected</span>
+                        <span style={{ fontSize: '0.7rem', color: '#10b981', fontWeight: '400' }}>Saved locally</span>
                       )}
                     </label>
                     <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.4rem' }}>
@@ -656,8 +754,8 @@ export default function Home() {
                         value={apiKeys[prov]}
                         onChange={e => saveApiKey(prov, e.target.value)}
                         placeholder={
-                          prov === 'openai' ? 'sk-...' :
-                          prov === 'anthropic' ? 'sk-ant-...' :
+                          prov === 'openai' ? 'sk-... (main chat: backend .env.local)' :
+                          prov === 'anthropic' ? 'sk-ant-... (main chat: backend .env.local)' :
                           'AI...'
                         }
                         className="api-key-input"

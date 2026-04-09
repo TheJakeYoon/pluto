@@ -1,5 +1,10 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Pluto chat (this repo)
+
+- The UI talks to the FastAPI backend (`../backend`). Default Ollama chat model is **`gpt-oss:20b`** unless you change **`default_chat_model`** in **`../backend/settings.json`** (restart the backend after edits).
+- Dev server runs on [http://localhost:4000](http://localhost:4000) (`npm run dev`).
+
 ## Getting Started
 
 First, run the development server:
@@ -14,7 +19,7 @@ pnpm dev
 bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:4000](http://localhost:4000) with your browser to see the result.
 
 You can start editing the page by modifying `app/page.js`. The page auto-updates as you edit the file.
 
