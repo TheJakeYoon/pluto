@@ -9,6 +9,7 @@ python-multipart==0.0.24
 
 # LangChain + RAG
 langchain-ollama==0.3.10
+langchain-openai==0.3.35
 langchain-core==0.3.83
 langchain-chroma==0.2.6
 langchain-text-splitters==0.3.11

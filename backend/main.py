@@ -4,12 +4,14 @@ import html
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Path
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 import psutil
 import subprocess
@@ -17,11 +19,14 @@ import httpx
 import json
 import time
 
-# Ollama chat uses LangChain ChatOllama (token-level streaming, native async).
-# See: https://docs.langchain.com/oss/python/integrations/chat/ollama
+# Local Ollama and cloud OpenAI chat use LangChain (ChatOllama / ChatOpenAI) for one stack.
+# Ollama: https://docs.langchain.com/oss/python/integrations/chat/ollama
+# OpenAI: https://docs.langchain.com/oss/python/integrations/chat/openai
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+from logging_setup import configure_app_logging
 from ollama_structured import ollama_structured_chat_complete
 from structured_chat import anthropic_structured_complete, openai_structured_complete
 
@@ -43,20 +48,19 @@ for _env_dir in (_PROJECT_ROOT, _BASE_DIR, os.path.join(_PROJECT_ROOT, "frontend
 
 
 def _load_backend_settings() -> dict:
-    """Load backend/settings.json. Missing or invalid file falls back to defaults."""
-    defaults: dict = {"default_chat_model": "gpt-oss:20b"}
+    """Load backend/settings.json. Missing or invalid file → empty dict (see ``_default_chat_model_from_settings``)."""
     try:
         with open(_SETTINGS_PATH, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            print("Warning: settings.json must be a JSON object; using defaults.")
-            return dict(defaults)
-        return {**defaults, **data}
+            print("Warning: settings.json must be a JSON object; ignoring.")
+            return {}
+        return dict(data)
     except FileNotFoundError:
-        return dict(defaults)
+        return {}
     except json.JSONDecodeError as e:
-        print(f"Warning: could not parse settings.json ({e}); using defaults.")
-        return dict(defaults)
+        print(f"Warning: could not parse settings.json ({e}); ignoring.")
+        return {}
 
 
 _backend_settings = _load_backend_settings()
@@ -66,6 +70,11 @@ def _default_chat_model_from_settings(settings: dict) -> str:
     v = settings.get("default_chat_model")
     if isinstance(v, str) and v.strip():
         return v.strip()
+    lm = settings.get("local_models")
+    if isinstance(lm, list) and lm:
+        first = lm[0]
+        if isinstance(first, str) and first.strip():
+            return first.strip()
     return "gpt-oss:20b"
 
 # RAG: embedding model for vector store (Ollama). Use one already loaded, e.g. embeddinggemma:latest
@@ -88,7 +97,7 @@ try:
 except ValueError:
     RAG_EMBEDDING_KEEP_ALIVE = _RAG_EMBED_KA  # e.g. "5m"
 
-# Default Ollama chat model for API and startup preload (settings.json → default_chat_model).
+# Default Ollama chat model when the client omits `model` (settings.json → default_chat_model, else local_models[0]).
 DEFAULT_CHAT_MODEL = _default_chat_model_from_settings(_backend_settings)
 
 _embeddings = None
@@ -137,57 +146,14 @@ def _get_vector_store():
         )
     return _vector_store
 
-def _stop_ollama_model_sync(model_name: str) -> None:
-    """Best-effort `ollama stop` (CLI); used at startup to free VRAM from other models."""
-    try:
-        subprocess.run(
-            ["ollama", "stop", model_name],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except Exception as e:
-        print(f"Warning: could not stop Ollama model {model_name!r}: {e}")
-
-
-# Load the default model on startup to prevent slow first response
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    client = ollama.AsyncClient()
-    try:
-        # Free memory: stop every loaded runner that is not the configured default.
-        loaded = await _async_ollama_loaded_model_names()
-        for name in loaded:
-            if _ollama_model_labels_equivalent(name, DEFAULT_CHAT_MODEL):
-                continue
-            print(f"Stopping non-default Ollama model (startup): {name}")
-            _stop_ollama_model_sync(name)
-
-        loaded_after = await _async_ollama_loaded_model_names()
-        default_already_loaded = any(
-            _ollama_model_labels_equivalent(DEFAULT_CHAT_MODEL, x) for x in loaded_after
-        )
-        if default_already_loaded:
-            print(f"Default model {DEFAULT_CHAT_MODEL} already loaded; skipping preload.")
-        else:
-            print(f"Preloading default model {DEFAULT_CHAT_MODEL}...")
-            model_list = await client.list()
-            models = [m.model for m in model_list.models] if hasattr(model_list, 'models') else (
-                [m.get('name') or m.get('model') for m in model_list.get('models', [])] if isinstance(model_list, dict) else []
-            )
-            if hasattr(model_list, '__class__') and model_list.__class__.__name__ == 'ListResponse':
-                models = [m.model for m in model_list.models]
-
-            base = DEFAULT_CHAT_MODEL.split(":", 1)[0]
-            if DEFAULT_CHAT_MODEL not in models and base not in [m.split(":")[0] for m in models]:
-                print(f"Model {DEFAULT_CHAT_MODEL} not found locally. Pulling...")
-                await client.pull(DEFAULT_CHAT_MODEL)
-                print("Model pulled successfully.")
-
-            await client.chat(model=DEFAULT_CHAT_MODEL, messages=[], keep_alive=OLLAMA_KEEP_ALIVE)
-            print("Default model preloaded successfully.")
-    except Exception as e:
-        print(f"Error during startup Ollama setup: {e}")
+    """No Ollama preload: models stay unloaded until the UI or ``POST /api/models/load``."""
+    _log = logging.getLogger("uvicorn.error")
+    _log.info(
+        "Ollama: skipping startup preload. Default chat model id for omitted `model` field: %s",
+        DEFAULT_CHAT_MODEL,
+    )
     yield
 
 app = FastAPI(
@@ -198,6 +164,8 @@ app = FastAPI(
         "Google via client-supplied key). See the human-readable guide at /api/documentation or /api/doc."
     ),
 )
+
+configure_app_logging(_BASE_DIR)
 
 
 def _configure_access_log_filter() -> None:
@@ -225,6 +193,49 @@ _configure_access_log_filter()
 # Do not log custom lines on `uvicorn.access`: its formatter expects record.args (client, method, …).
 # Use `uvicorn.error` so messages appear in the same console as uvicorn (always configured).
 _api_timestamp_logger = logging.getLogger("uvicorn.error")
+
+
+def _format_http_exception_detail_for_log(detail: object) -> str:
+    if detail is None:
+        return "(no detail)"
+    if isinstance(detail, str):
+        return detail
+    try:
+        return json.dumps(detail, indent=2, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return repr(detail)
+
+
+def _log_upstream_http_error_visible(request: Request, exc: HTTPException) -> None:
+    """High-visibility log for bad-gateway / upstream failures (console + rotating file)."""
+    detail_text = _format_http_exception_detail_for_log(exc.detail)
+    client = request.client.host if request.client else "?"
+    bar = "=" * 78
+    msg = (
+        "\n"
+        + bar
+        + "\n"
+        + f"  HTTP {exc.status_code}  {request.method} {request.url.path}\n"
+        + f"  client={client}\n"
+        + bar
+        + "\n"
+        + detail_text
+        + "\n"
+        + bar
+    )
+    _api_timestamp_logger.error("%s", msg)
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_upstream_visible_log(request: Request, exc: HTTPException):
+    if exc.status_code in (502, 503):
+        _log_upstream_http_error_visible(request, exc)
+    return await http_exception_handler(request, exc)
+
+
+# Avoid buffering huge request bodies in middleware (multipart / large uploads).
+_HTTP_SKIP_BODY_PREFIX = ("multipart/", "application/octet-stream")
+_HTTP_MAX_PREFETCH = int(os.environ.get("HTTP_MIDDLEWARE_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 
 
 def _local_iso_timestamp() -> str:
@@ -293,12 +304,22 @@ async def add_local_timestamps(request: Request, call_next):
 
     body_cache: Optional[bytes] = None
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        body_cache = await request.body()
+        ct = (request.headers.get("content-type") or "").lower()
+        cl_raw = request.headers.get("content-length")
+        skip_body_cache = any(ct.startswith(p) for p in _HTTP_SKIP_BODY_PREFIX)
+        if not skip_body_cache and cl_raw:
+            try:
+                if int(cl_raw) > _HTTP_MAX_PREFETCH:
+                    skip_body_cache = True
+            except ValueError:
+                pass
+        if not skip_body_cache:
+            body_cache = await request.body()
 
-        async def receive():
-            return {"type": "http.request", "body": body_cache, "more_body": False}
+            async def receive():
+                return {"type": "http.request", "body": body_cache, "more_body": False}
 
-        request._receive = receive
+            request._receive = receive
 
     response = await call_next(request)
     resp_ts = _local_iso_timestamp()
@@ -337,6 +358,16 @@ class ChatMessage(BaseModel):
         description='Message author: typically "user", "assistant", or "system".',
     )
     content: str = Field(..., description="Plain-text (or markdown) message body.")
+
+
+OpenAIReasoningEffort = Optional[Literal["none", "low", "medium", "high", "xhigh"]]
+
+
+def _openai_reasoning_effort_optional(val: OpenAIReasoningEffort) -> Optional[str]:
+    """Map API field to LangChain ``ChatOpenAI.reasoning_effort`` (None → omit parameter)."""
+    if val is None or val == "none":
+        return None
+    return val
 
 
 class StructuredToolDefinition(BaseModel):
@@ -383,14 +414,22 @@ class ChatRequest(BaseModel):
     thinking: bool = Field(
         True,
         description=(
-            "Gemma 4 (Ollama): when true, enable internal reasoning via <|think|> on the system prompt; "
-            "responses still omit thought text."
+            "Ollama (local): passed to LangChain ``ChatOllama`` as ``reasoning`` for non-Gemma models (enables "
+            "Ollama thinking/reasoning API). Gemma 4: when true, prepends <|think|> on the RAG system message and "
+            "streamed replies strip hidden thought; structured_output uses ``reasoning=false`` only when thinking is false."
+        ),
+    )
+    reasoning: OpenAIReasoningEffort = Field(
+        None,
+        description=(
+            "OpenAI (cloud only): maps to LangChain ``ChatOpenAI.reasoning_effort`` for reasoning models "
+            "(omit when null or ``none``; ``low`` | ``medium`` | ``high`` | ``xhigh`` sent as-is)."
         ),
     )
     structured_output: Optional[bool] = Field(
         default=None,
         description=(
-            "Optional; omit or null for false. When true with stream=false, use tool calling for structured output: "
+            "Optional; omit or null for false. When true with stream=false, use LangChain structured output (forced tool / function calling): "
             "local Ollama (https://docs.ollama.com/capabilities/tool-calling) or cloud OpenAI/Anthropic. "
             "Response includes structured; with local Ollama set structured_tool for a custom JSON shape."
         ),
@@ -413,6 +452,10 @@ class CloudChatRequest(BaseModel):
     model: str = Field(..., description="Provider-specific model id.")
     messages: List[ChatMessage] = Field(..., description="Chat history for the request.")
     api_key: str = Field(..., description="API key for this provider (sent from client; not used for server-key OpenAI/Anthropic on /api/chat).")
+    reasoning: OpenAIReasoningEffort = Field(
+        None,
+        description="OpenAI only: same values as POST /api/chat ``reasoning`` → LangChain ``ChatOpenAI.reasoning_effort``.",
+    )
 
 
 class AddDocumentsRequest(BaseModel):
@@ -433,7 +476,6 @@ class DeleteChunksRequest(BaseModel):
 # Short-term memory: keep last N messages so context stays focused and within model limits
 # See: https://docs.langchain.com/oss/python/langchain/short-term-memory
 MAX_CONTEXT_MESSAGES = int(os.environ.get("MAX_CONTEXT_MESSAGES", "30"))
-_thread_store: dict[str, list] = {}  # thread_id -> list of {role, content}
 
 
 def _list_available_models() -> List[str]:
@@ -523,6 +565,21 @@ def _trim_messages(messages: List[dict], max_messages: int = MAX_CONTEXT_MESSAGE
     return first + messages[-max_rest:]
 
 
+# In-memory thread store: bounded so the process can run indefinitely.
+THREAD_STORE_MAX_THREADS = int(os.environ.get("THREAD_STORE_MAX_THREADS", "5000"))
+THREAD_STORE_MAX_MESSAGES = int(os.environ.get("THREAD_STORE_MAX_MESSAGES", str(MAX_CONTEXT_MESSAGES)))
+_thread_store: OrderedDict[str, List[dict]] = OrderedDict()
+
+
+def _thread_store_put(thread_id: str, messages: List[dict]) -> None:
+    """Trim messages per thread and LRU-evict least-recently-used threads when over cap."""
+    trimmed = _trim_messages(messages, max_messages=THREAD_STORE_MAX_MESSAGES)
+    _thread_store[thread_id] = trimmed
+    _thread_store.move_to_end(thread_id)
+    while len(_thread_store) > THREAD_STORE_MAX_THREADS:
+        _thread_store.popitem(last=False)
+
+
 def _to_langchain_messages(messages: List[dict]) -> List:
     """Convert API messages to LangChain message types (see ChatOllama integration)."""
     lc_messages = []
@@ -546,6 +603,13 @@ GEMMA4_THOUGHT_END = "<channel|>"
 
 def _is_gemma4_model(model: str) -> bool:
     return "gemma4" in (model or "").lower()
+
+
+def _ollama_reasoning_invoke_kw(*, thinking: bool, model: str) -> dict[str, Any]:
+    """Map ``thinking`` to LangChain ``ChatOllama`` ``reasoning`` (Gemma 4 uses ``<|think|>`` on the system prompt instead)."""
+    if _is_gemma4_model(model):
+        return {}
+    return {"reasoning": bool(thinking)}
 
 
 def _ollama_chat_sampling_kwargs(model: str) -> dict:
@@ -761,7 +825,7 @@ async def _ollama_chat_stream_chunks(
         keep_alive=OLLAMA_KEEP_ALIVE,
         **_ollama_chat_sampling_kwargs(model),
     )
-    stream = llm.astream(lc_messages)
+    stream = llm.astream(lc_messages, **_ollama_reasoning_invoke_kw(thinking=thinking, model=model))
     t_start = time.perf_counter()
     if timing is not None:
         timing["t_start"] = t_start
@@ -813,7 +877,7 @@ async def _ollama_chat_complete_text(model: str, messages: List[dict], *, thinki
         **_ollama_chat_sampling_kwargs(model),
     )
     t0 = time.perf_counter()
-    result = await llm.ainvoke(lc_messages)
+    result = await llm.ainvoke(lc_messages, **_ollama_reasoning_invoke_kw(thinking=thinking, model=model))
     t1 = time.perf_counter()
     raw = _assistant_content_from_invoke(result)
     rm = getattr(result, "response_metadata", None) or {}
@@ -871,9 +935,14 @@ def _collapse_system_messages(messages: List[dict]) -> List[dict]:
     return [{"role": "system", "content": combined}] + rest
 
 
-def _messages_for_cloud_chat_with_rag(messages: List[dict]) -> List[dict]:
+def _messages_for_cloud_chat_with_rag(
+    messages: List[dict],
+    *,
+    thinking: bool = False,
+    model: str = "",
+) -> List[dict]:
     """Same RAG context as local Ollama chat, formatted for OpenAI/Anthropic."""
-    lc = _build_ollama_lc_messages_with_rag(messages, model="")
+    lc = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model)
     flat = _langchain_to_openai_compatible_dicts(lc)
     return _collapse_system_messages(flat)
 
@@ -911,32 +980,39 @@ def _cloud_provider_for_model(model: str) -> str:
     )
 
 
-async def _openai_chat_complete_messages(model: str, messages: List[ChatMessage], api_key: str) -> str:
-    payload = [{"role": m.role, "content": m.content} for m in messages]
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"model": model, "messages": payload, "stream": False},
+def _chat_api_messages_to_langchain(messages: List[ChatMessage]) -> list:
+    out: list = []
+    for m in messages:
+        role = (m.role or "user").lower()
+        if role == "system":
+            out.append(SystemMessage(content=m.content))
+        elif role == "assistant":
+            out.append(AIMessage(content=m.content))
+        else:
+            out.append(HumanMessage(content=m.content))
+    return out
+
+
+async def _openai_chat_complete_messages(
+    model: str,
+    messages: List[ChatMessage],
+    api_key: str,
+    *,
+    reasoning_effort: Optional[str] = None,
+) -> str:
+    lc = _chat_api_messages_to_langchain(messages)
+    try:
+        llm = ChatOpenAI(
+            model=model,
+            api_key=api_key,
             timeout=httpx.Timeout(30.0, read=300.0),
+            max_retries=2,
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
         )
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=r.text)
-        data = r.json()
-        choice0 = (data.get("choices") or [{}])[0]
-        msg = choice0.get("message") or {}
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(
-                (part.get("text", "") if isinstance(part, dict) else str(part))
-                for part in content
-            )
-        return ""
+        result = await llm.ainvoke(lc)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return _assistant_content_from_invoke(result)
 
 
 async def _anthropic_chat_complete_messages(model: str, messages: List[ChatMessage], api_key: str) -> str:
@@ -988,9 +1064,11 @@ async def chat_completion(request: ChatRequest):
     the request uses env keys `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`. Otherwise Ollama is used; non-default
     models must already be loaded (`POST /api/models/load`).
 
-    **structured_output** with `stream=false`: uses tool calling — Ollama (see ollama.com tool calling docs)
-    or cloud OpenAI/Anthropic. Local default tool is `deliver_chat_response` (segments); set **structured_tool**
+    **structured_output** with `stream=false`: uses LangChain ``with_structured_output`` (function calling) —
+    local Ollama (see ollama.com tool calling) or cloud OpenAI/Anthropic. Default tool is `deliver_chat_response` (segments); set **structured_tool**
     for a custom JSON schema. **structured_tool** is not supported on cloud.
+
+    **thinking** (Ollama) and **reasoning** (OpenAI cloud): see field descriptions; both map into LangChain chat models.
     """
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
     messages = _trim_messages(messages)
@@ -1024,7 +1102,11 @@ async def chat_completion(request: ChatRequest):
                 ),
             )
         try:
-            cloud_msgs = _messages_for_cloud_chat_with_rag(messages)
+            cloud_msgs = _messages_for_cloud_chat_with_rag(
+                messages,
+                thinking=bool(request.thinking),
+                model=request.model,
+            )
         except HTTPException:
             raise
         except Exception as e:
@@ -1036,6 +1118,7 @@ async def chat_completion(request: ChatRequest):
             model=request.model,
             messages=chat_messages,
             api_key=api_key,
+            reasoning=request.reasoning,
         )
 
         if want_structured_output and request.stream:
@@ -1050,7 +1133,10 @@ async def chat_completion(request: ChatRequest):
                     cloud_dicts = [{"role": m.role, "content": m.content} for m in chat_messages]
                     if provider == "openai":
                         full_content, segments = await openai_structured_complete(
-                            request.model, cloud_dicts, api_key
+                            request.model,
+                            cloud_dicts,
+                            api_key,
+                            reasoning_effort=_openai_reasoning_effort_optional(request.reasoning),
                         )
                     else:
                         full_content, segments = await anthropic_structured_complete(
@@ -1059,7 +1145,7 @@ async def chat_completion(request: ChatRequest):
                     if thread_id:
                         stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                         stored.append({"role": "assistant", "content": full_content})
-                        _thread_store[thread_id] = stored
+                        _thread_store_put(thread_id, stored)
                     return {
                         "message": {"role": "assistant", "content": full_content},
                         "structured": {"segments": segments},
@@ -1069,7 +1155,10 @@ async def chat_completion(request: ChatRequest):
                     }
                 if provider == "openai":
                     full_content = await _openai_chat_complete_messages(
-                        request.model, chat_messages, api_key
+                        request.model,
+                        chat_messages,
+                        api_key,
+                        reasoning_effort=_openai_reasoning_effort_optional(request.reasoning),
                     )
                 else:
                     full_content = await _anthropic_chat_complete_messages(
@@ -1078,7 +1167,7 @@ async def chat_completion(request: ChatRequest):
                 if thread_id:
                     stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                     stored.append({"role": "assistant", "content": full_content})
-                    _thread_store[thread_id] = stored
+                    _thread_store_put(thread_id, stored)
                 return {
                     "message": {"role": "assistant", "content": full_content},
                     "model": request.model,
@@ -1108,7 +1197,7 @@ async def chat_completion(request: ChatRequest):
                 if thread_id:
                     stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                     stored.append({"role": "assistant", "content": full_content})
-                    _thread_store[thread_id] = stored
+                    _thread_store_put(thread_id, stored)
             except HTTPException:
                 raise
             except Exception as e:
@@ -1122,7 +1211,7 @@ async def chat_completion(request: ChatRequest):
             status_code=400,
             detail=f"Model '{request.model}' is configured as the embedding model for RAG and cannot be used for chat. Please select a chat model (e.g. '{DEFAULT_CHAT_MODEL}').",
         )
-    # Only the default chat model from settings may be used without an explicit Load; others must be running (ollama ps).
+    # Only the configured default chat model may be used without an explicit Load; others must be running (ollama ps).
     if not _ollama_model_labels_equivalent(request.model, DEFAULT_CHAT_MODEL):
         if not await _ollama_chat_model_is_loaded(request.model):
             raise HTTPException(
@@ -1137,11 +1226,15 @@ async def chat_completion(request: ChatRequest):
         if request.stream:
             raise HTTPException(
                 status_code=400,
-                detail="structured_output requires stream=false (Ollama tool calling is non-streaming).",
+                detail="structured_output requires stream=false (Ollama structured output is non-streaming).",
             )
         try:
             try:
-                rag_msgs = _messages_for_cloud_chat_with_rag(messages)
+                rag_msgs = _messages_for_cloud_chat_with_rag(
+                    messages,
+                    thinking=bool(request.thinking),
+                    model=request.model,
+                )
             except HTTPException:
                 raise
             except Exception as e:
@@ -1155,11 +1248,12 @@ async def chat_completion(request: ChatRequest):
                 api_msgs,
                 custom_tool=custom_tool,
                 keep_alive=OLLAMA_KEEP_ALIVE,
+                thinking=bool(request.thinking),
             )
             if thread_id:
                 stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                 stored.append({"role": "assistant", "content": full_content})
-                _thread_store[thread_id] = stored
+                _thread_store_put(thread_id, stored)
             return {
                 "message": {"role": "assistant", "content": full_content},
                 "structured": structured,
@@ -1180,7 +1274,7 @@ async def chat_completion(request: ChatRequest):
             if thread_id:
                 stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                 stored.append({"role": "assistant", "content": full_content})
-                _thread_store[thread_id] = stored
+                _thread_store_put(thread_id, stored)
             return {
                 "message": {"role": "assistant", "content": full_content},
                 "model": request.model,
@@ -1238,7 +1332,7 @@ async def chat_completion(request: ChatRequest):
             if thread_id:
                 stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                 stored.append({"role": "assistant", "content": full_content})
-                _thread_store[thread_id] = stored
+                _thread_store_put(thread_id, stored)
         except HTTPException:
             raise
         except Exception as e:
@@ -1260,40 +1354,30 @@ def get_thread_messages(
     """Return stored short-term memory (message history) for a thread, if any."""
     if thread_id not in _thread_store:
         return {"messages": []}
+    _thread_store.move_to_end(thread_id)
     return {"messages": _thread_store[thread_id]}
 
 
 # ─── Cloud LLM Streaming Helpers ───
 
 async def stream_openai(request: CloudChatRequest):
-    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-    async with httpx.AsyncClient() as client:
-        async with client.stream(
-            "POST",
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {request.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={"model": request.model, "messages": messages, "stream": True},
+    lc = _chat_api_messages_to_langchain(request.messages)
+    re = _openai_reasoning_effort_optional(request.reasoning)
+    try:
+        llm = ChatOpenAI(
+            model=request.model,
+            api_key=request.api_key,
             timeout=httpx.Timeout(30.0, read=120.0),
-        ) as response:
-            if response.status_code != 200:
-                error_body = await response.aread()
-                yield f"\n[Error: OpenAI API {response.status_code}: {error_body.decode()}]"
-                return
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if content:
-                            yield content
-                    except json.JSONDecodeError:
-                        continue
+            max_retries=1,
+            streaming=True,
+            **({"reasoning_effort": re} if re else {}),
+        )
+        async for chunk in llm.astream(lc):
+            piece = _assistant_content_from_invoke(chunk)
+            if piece:
+                yield piece
+    except Exception as e:
+        yield f"\n[Error: OpenAI {e}]"
 
 
 async def stream_anthropic(request: CloudChatRequest):
@@ -1444,11 +1528,15 @@ def _api_usage_guide_html() -> str:
             <strong>thread_id</strong> — optional; server stores last messages per id (see GET thread).<br/>
             <strong>instruction</strong> — optional; prepended to last user message for this request only.<br/>
             <strong>structured_output</strong> — optional JSON field; omit or null for false. With
-            <code>stream: false</code>, uses tool calling (local Ollama or cloud OpenAI/Anthropic).
+            <code>stream: false</code>, uses LangChain structured output (local Ollama or cloud OpenAI/Anthropic).
             Default tool: <code>deliver_chat_response</code> → <code>structured.segments</code>.
             <strong>structured_tool</strong> — optional (local Ollama only): custom <code>name</code> +
             JSON Schema <code>parameters</code> → <code>structured.tool_name</code> +
-            <code>structured.arguments</code>.
+            <code>structured.arguments</code>.<br/>
+            <strong>thinking</strong> — Ollama: LangChain <code>ChatOllama</code> <code>reasoning</code> (non-Gemma) or Gemma 4
+            <code>&lt;|think|&gt;</code> + strip; structured Gemma uses <code>think=false</code> when <code>false</code>.<br/>
+            <strong>reasoning</strong> — OpenAI cloud: <code>none</code> | <code>low</code> | <code>medium</code> | <code>high</code> | <code>xhigh</code>
+            → LangChain <code>ChatOpenAI.reasoning_effort</code> (<code>none</code> omits the parameter).
           </td>
         </tr>
         <tr>
@@ -1456,7 +1544,8 @@ def _api_usage_guide_html() -> str:
           <td>Stream chat using the <strong>client</strong> <code>api_key</code> (e.g. Google Gemini in the browser).</td>
           <td>
             <strong>provider</strong> — <code>openai</code> | <code>anthropic</code> | <code>google</code>.<br/>
-            <strong>model</strong>, <strong>messages</strong>, <strong>api_key</strong>.
+            <strong>model</strong>, <strong>messages</strong>, <strong>api_key</strong>.<br/>
+            <strong>reasoning</strong> — optional; OpenAI only (same as <code>/api/chat</code>).
           </td>
         </tr>
         <tr>
@@ -2014,7 +2103,7 @@ async def ollama_verify_tools_json(model: Optional[str] = None):
                 status_code=400,
                 detail=(
                     f"Model '{m}' is not loaded in Ollama. "
-                    "Load it in Manage → Local Models (or use default_chat_model)."
+                    "Load it in Manage → Local Models (or pass the default from settings: default_chat_model / local_models[0])."
                 ),
             )
     try:

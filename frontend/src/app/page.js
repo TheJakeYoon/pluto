@@ -103,8 +103,10 @@ export default function Home() {
   const [models, setModels] = useState([]);
   const [loadedModels, setLoadedModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState('gpt-oss:20b');
-  /** Gemma 4: server enables <|think|> and strips internal thought from streamed text. */
-  const [gemma4Thinking, setGemma4Thinking] = useState(true);
+  /** Ollama: LangChain ChatOllama ``reasoning`` (non-Gemma) or Gemma 4 <|think|> + strip from stream. */
+  const [ollamaThinking, setOllamaThinking] = useState(true);
+  /** OpenAI reasoning models: maps to LangChain ChatOpenAI reasoning_effort (none = omit). */
+  const [openaiReasoning, setOpenaiReasoning] = useState('none');
   const [manageModel, setManageModel] = useState('gpt-oss:20b');
   const [isManageModalOpen, setIsManageModalOpen] = useState(false);
 
@@ -332,9 +334,7 @@ export default function Home() {
             messages: newMessages,
             thread_id: threadId,
             stream: true,
-            ...(selectedModel.toLowerCase().includes('gemma4')
-              ? { thinking: gemma4Thinking }
-              : {}),
+            thinking: ollamaThinking,
           }),
         });
       } else if (provider === 'openai' || provider === 'anthropic') {
@@ -348,6 +348,9 @@ export default function Home() {
             messages: newMessages,
             thread_id: threadId,
             stream: true,
+            ...(provider === 'openai'
+              ? { reasoning: openaiReasoning }
+              : {}),
           }),
         });
       } else {
@@ -360,6 +363,7 @@ export default function Home() {
             model: cloudModels[provider],
             messages: newMessages,
             api_key: apiKeys[provider],
+            ...(provider === 'openai' ? { reasoning: openaiReasoning } : {}),
           }),
         });
       }
@@ -514,7 +518,7 @@ export default function Home() {
               )}
             </div>
           </div>
-          {provider === 'ollama' && selectedModel.toLowerCase().includes('gemma4') && (
+          {provider === 'ollama' && (
             <div style={{ display: 'flex', justifyContent: 'center', marginTop: '0.35rem' }}>
               <label
                 style={{
@@ -529,11 +533,41 @@ export default function Home() {
               >
                 <input
                   type="checkbox"
-                  checked={gemma4Thinking}
-                  onChange={(e) => setGemma4Thinking(e.target.checked)}
+                  checked={ollamaThinking}
+                  onChange={(e) => setOllamaThinking(e.target.checked)}
                 />
-                Gemma 4 thinking (hidden from chat; Ollama sampling preset)
+                Thinking / reasoning (Ollama + LangChain; Gemma 4 uses hidden {'<|think|>'})
               </label>
+            </div>
+          )}
+          {provider === 'openai' && (
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'center',
+                alignItems: 'center',
+                gap: '0.45rem',
+                marginTop: '0.35rem',
+                fontSize: '0.78rem',
+                color: 'var(--text-secondary)',
+              }}
+            >
+              <label htmlFor="openai-reasoning" style={{ userSelect: 'none' }}>
+                Reasoning effort
+              </label>
+              <select
+                id="openai-reasoning"
+                value={openaiReasoning}
+                onChange={(e) => setOpenaiReasoning(e.target.value)}
+                className="model-badge"
+                style={{ cursor: 'pointer', fontSize: '0.78rem' }}
+              >
+                <option value="none">none (default)</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+              </select>
             </div>
           )}
         </header>

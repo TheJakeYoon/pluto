@@ -50,9 +50,16 @@ def _default_model_from_settings() -> str:
     try:
         with open(_SETTINGS, encoding="utf-8") as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            return "gpt-oss:20b"
         v = data.get("default_chat_model")
         if isinstance(v, str) and v.strip():
             return v.strip()
+        lm = data.get("local_models")
+        if isinstance(lm, list) and lm:
+            first = lm[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
     except (OSError, json.JSONDecodeError, TypeError):
         pass
     return "gpt-oss:20b"
@@ -183,7 +190,7 @@ def main() -> None:
         "model",
         nargs="?",
         default=os.environ.get("OLLAMA_TEST_MODEL") or _default_model_from_settings(),
-        help="Ollama model id (default: OLLAMA_TEST_MODEL or settings.json default_chat_model)",
+        help="Ollama model id (default: OLLAMA_TEST_MODEL or settings.json default_chat_model / local_models[0])",
     )
     args = p.parse_args()
     raise SystemExit(asyncio.run(_async_main(args.model)))
