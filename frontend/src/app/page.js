@@ -103,6 +103,8 @@ export default function Home() {
   const [models, setModels] = useState([]);
   const [loadedModels, setLoadedModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState('gpt-oss:20b');
+  /** Gemma 4: server enables <|think|> and strips internal thought from streamed text. */
+  const [gemma4Thinking, setGemma4Thinking] = useState(true);
   const [manageModel, setManageModel] = useState('gpt-oss:20b');
   const [isManageModalOpen, setIsManageModalOpen] = useState(false);
 
@@ -330,6 +332,9 @@ export default function Home() {
             messages: newMessages,
             thread_id: threadId,
             stream: true,
+            ...(selectedModel.toLowerCase().includes('gemma4')
+              ? { thinking: gemma4Thinking }
+              : {}),
           }),
         });
       } else if (provider === 'openai' || provider === 'anthropic') {
@@ -509,6 +514,28 @@ export default function Home() {
               )}
             </div>
           </div>
+          {provider === 'ollama' && selectedModel.toLowerCase().includes('gemma4') && (
+            <div style={{ display: 'flex', justifyContent: 'center', marginTop: '0.35rem' }}>
+              <label
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '0.4rem',
+                  fontSize: '0.78rem',
+                  color: 'var(--text-secondary)',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={gemma4Thinking}
+                  onChange={(e) => setGemma4Thinking(e.target.checked)}
+                />
+                Gemma 4 thinking (hidden from chat; Ollama sampling preset)
+              </label>
+            </div>
+          )}
         </header>
 
         {/* Chat Messages */}

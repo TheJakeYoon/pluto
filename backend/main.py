@@ -379,6 +379,13 @@ class ChatRequest(BaseModel):
         False,
         description="If true, use cloud LLM with OPENAI_API_KEY or ANTHROPIC_API_KEY from server env / .env.local.",
     )
+    thinking: bool = Field(
+        True,
+        description=(
+            "Gemma 4 (Ollama): when true, enable internal reasoning via <|think|> on the system prompt; "
+            "responses still omit thought text."
+        ),
+    )
     structured_output: Optional[bool] = Field(
         default=None,
         description=(
@@ -530,6 +537,64 @@ def _to_langchain_messages(messages: List[dict]) -> List:
     return lc_messages
 
 
+GEMMA4_THINK_TRIGGER = "<|think|>"
+# Gemma 4 model output: reasoning between these markers, then the user-facing answer (see Ollama Gemma 4 readme).
+GEMMA4_THOUGHT_START = "<|channel>thought"
+GEMMA4_THOUGHT_END = "<channel|>"
+
+
+def _is_gemma4_model(model: str) -> bool:
+    return "gemma4" in (model or "").lower()
+
+
+def _ollama_chat_sampling_kwargs(model: str) -> dict:
+    """Gemma 4 on Ollama recommends temperature=1, top_p=0.95, top_k=64; other models keep deterministic defaults."""
+    if _is_gemma4_model(model):
+        return {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
+    return {"temperature": 0}
+
+
+def _strip_gemma4_public_answer(text: str) -> str:
+    """Remove Gemma 4 internal thought blocks; keep only content after the closing marker."""
+    if not text:
+        return text
+    s = text
+    while True:
+        i = s.find(GEMMA4_THOUGHT_START)
+        if i == -1:
+            break
+        j = s.find(GEMMA4_THOUGHT_END, i + len(GEMMA4_THOUGHT_START))
+        if j == -1:
+            return (s[:i]).rstrip()
+        s = s[:i] + s[j + len(GEMMA4_THOUGHT_END) :]
+    return s
+
+
+async def _stream_strip_gemma4_thought(achunk_stream):
+    """Buffer until the first thought block closes, then stream deltas (public answer only)."""
+    buf = ""
+    past = False
+    async for chunk in achunk_stream:
+        c = getattr(chunk, "content", None) or ""
+        if not c:
+            continue
+        if past:
+            yield c
+            continue
+        buf += c
+        si = buf.find(GEMMA4_THOUGHT_START)
+        if si != -1:
+            ei = buf.find(GEMMA4_THOUGHT_END, si + len(GEMMA4_THOUGHT_START))
+            if ei != -1:
+                past = True
+                tail = buf[ei + len(GEMMA4_THOUGHT_END) :]
+                buf = ""
+                if tail:
+                    yield tail
+    if not past and buf:
+        yield _strip_gemma4_public_answer(buf)
+
+
 def _apply_instruction_to_last_user(messages: List[dict], instruction: Optional[str]) -> List[dict]:
     """Prepend optional instruction to the beginning of the last user message (model input for this turn)."""
     if not instruction or not str(instruction).strip():
@@ -544,7 +609,9 @@ def _apply_instruction_to_last_user(messages: List[dict], instruction: Optional[
     return out
 
 
-def _build_ollama_lc_messages_with_rag(messages: List[dict]) -> List:
+def _build_ollama_lc_messages_with_rag(
+    messages: List[dict], *, thinking: bool = False, model: str = ""
+) -> List:
     """RAG retrieve from latest user text, then LangChain messages + RAG system prefix."""
     last_user_content = None
     for i in range(len(messages) - 1, -1, -1):
@@ -577,20 +644,28 @@ def _build_ollama_lc_messages_with_rag(messages: List[dict]) -> List:
             "Answer from your general knowledge."
         )
     lc_messages = _to_langchain_messages(messages)
-    return [SystemMessage(content=rag_system)] + lc_messages
+    first_system = SystemMessage(content=rag_system)
+    if thinking and _is_gemma4_model(model):
+        first_system = SystemMessage(content=f"{GEMMA4_THINK_TRIGGER}\n{rag_system}")
+    return [first_system] + lc_messages
 
 
-async def _ollama_chat_stream_chunks(model: str, messages: List[dict]):
+async def _ollama_chat_stream_chunks(model: str, messages: List[dict], *, thinking: bool = False):
     """Yields text tokens from ChatOllama (RAG + streaming)."""
-    lc_messages = _build_ollama_lc_messages_with_rag(messages)
+    lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model)
     llm = ChatOllama(
         model=model,
-        temperature=0,
         keep_alive=OLLAMA_KEEP_ALIVE,
+        **_ollama_chat_sampling_kwargs(model),
     )
-    async for chunk in llm.astream(lc_messages):
-        if chunk.content:
-            yield chunk.content
+    stream = llm.astream(lc_messages)
+    if _is_gemma4_model(model):
+        async for part in _stream_strip_gemma4_thought(stream):
+            yield part
+    else:
+        async for chunk in stream:
+            if chunk.content:
+                yield chunk.content
 
 
 def _assistant_content_from_invoke(result) -> str:
@@ -610,16 +685,19 @@ def _assistant_content_from_invoke(result) -> str:
     return str(c) if c is not None else ""
 
 
-async def _ollama_chat_complete_text(model: str, messages: List[dict]) -> str:
+async def _ollama_chat_complete_text(model: str, messages: List[dict], *, thinking: bool = False) -> str:
     """Single non-streaming completion (same RAG path as streaming)."""
-    lc_messages = _build_ollama_lc_messages_with_rag(messages)
+    lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model)
     llm = ChatOllama(
         model=model,
-        temperature=0,
         keep_alive=OLLAMA_KEEP_ALIVE,
+        **_ollama_chat_sampling_kwargs(model),
     )
     result = await llm.ainvoke(lc_messages)
-    return _assistant_content_from_invoke(result)
+    raw = _assistant_content_from_invoke(result)
+    if _is_gemma4_model(model):
+        return _strip_gemma4_public_answer(raw)
+    return raw
 
 
 def _langchain_to_openai_compatible_dicts(lc_messages: List) -> List[dict]:
@@ -655,7 +733,7 @@ def _collapse_system_messages(messages: List[dict]) -> List[dict]:
 
 def _messages_for_cloud_chat_with_rag(messages: List[dict]) -> List[dict]:
     """Same RAG context as local Ollama chat, formatted for OpenAI/Anthropic."""
-    lc = _build_ollama_lc_messages_with_rag(messages)
+    lc = _build_ollama_lc_messages_with_rag(messages, model="")
     flat = _langchain_to_openai_compatible_dicts(lc)
     return _collapse_system_messages(flat)
 
@@ -956,7 +1034,9 @@ async def chat_completion(request: ChatRequest):
 
     if not request.stream:
         try:
-            full_content = await _ollama_chat_complete_text(request.model, messages)
+            full_content = await _ollama_chat_complete_text(
+                request.model, messages, thinking=bool(request.thinking)
+            )
             if thread_id:
                 stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                 stored.append({"role": "assistant", "content": full_content})
@@ -973,7 +1053,9 @@ async def chat_completion(request: ChatRequest):
     async def generate_response():
         full_content = ""
         try:
-            async for part in _ollama_chat_stream_chunks(request.model, messages):
+            async for part in _ollama_chat_stream_chunks(
+                request.model, messages, thinking=bool(request.thinking)
+            ):
                 full_content += part
                 yield part
             if thread_id:
@@ -1736,6 +1818,35 @@ async def load_model(request: LoadModelRequest):
         if chat_err is not None:
             raise HTTPException(status_code=500, detail=str(chat_err))
         raise HTTPException(status_code=500, detail=str(e2))
+
+
+@app.get("/api/ollama/verify-tools-json")
+async def ollama_verify_tools_json(model: Optional[str] = None):
+    """Run ChatOllama tool-calling and JSON-schema (LaTeX string) checks against a loaded Ollama model."""
+    from ollama_tools_json_verify import run_ollama_tools_json_verification
+
+    m = (model or "").strip() or DEFAULT_CHAT_MODEL
+    if m == RAG_EMBEDDING_MODEL:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{m}' is the RAG embedding model; pick a chat model.",
+        )
+    if not _ollama_model_labels_equivalent(m, DEFAULT_CHAT_MODEL):
+        if not await _ollama_chat_model_is_loaded(m):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{m}' is not loaded in Ollama. "
+                    "Load it in Manage → Local Models (or use default_chat_model)."
+                ),
+            )
+    try:
+        return await run_ollama_tools_json_verification(m)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
 
 @app.get("/api/sysinfo")
 async def get_sysinfo():
