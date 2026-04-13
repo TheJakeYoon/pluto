@@ -4,11 +4,12 @@ import html
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from typing import Annotated, Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import psutil
 import subprocess
@@ -19,6 +20,9 @@ import json
 # See: https://docs.langchain.com/oss/python/integrations/chat/ollama
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+from ollama_structured import ollama_structured_chat_complete
+from structured_chat import anthropic_structured_complete, openai_structured_complete
 
 # ChromaDB persist directory under project root / database
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -185,7 +189,14 @@ async def lifespan(app: FastAPI):
         print(f"Error during startup Ollama setup: {e}")
     yield
 
-app = FastAPI(title="Ollama Chatbot API", lifespan=lifespan)
+app = FastAPI(
+    title="Ollama Chatbot API",
+    lifespan=lifespan,
+    description=(
+        "Local Ollama chat with optional RAG, plus cloud chat (OpenAI / Anthropic via server env keys, "
+        "Google via client-supplied key). See the human-readable guide at /api/documentation or /api/doc."
+    ),
+)
 
 
 def _configure_access_log_filter() -> None:
@@ -220,6 +231,57 @@ def _local_iso_timestamp() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+_SENSITIVE_REQUEST_HEADER_NAMES = frozenset(
+    {"authorization", "cookie", "x-api-key", "proxy-authorization"}
+)
+
+
+def _request_headers_for_bad_request_log(request: Request) -> dict:
+    """Header names/values suitable for logs (credentials redacted)."""
+    out: dict = {}
+    for key, value in request.headers.items():
+        lk = key.lower()
+        out[key] = "[REDACTED]" if lk in _SENSITIVE_REQUEST_HEADER_NAMES else value
+    return out
+
+
+def _body_value_for_bad_request_log(body: bytes, content_type: str) -> object:
+    """Parse JSON when possible; otherwise UTF-8 text with a size cap."""
+    if not body:
+        return None
+    ct = (content_type or "").lower()
+    stripped = body.lstrip()
+    if "application/json" in ct or (stripped[:1] in (b"{", b"[")):
+        try:
+            return json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+    text = body.decode("utf-8", errors="replace")
+    max_chars = 100_000
+    if len(text) > max_chars:
+        return text[:max_chars] + f"\n... [truncated, {len(text)} chars total]"
+    return text
+
+
+def _bad_request_request_dump(request: Request, body_cache: Optional[bytes]) -> str:
+    payload = {
+        "method": request.method,
+        "path": request.url.path,
+        "url": str(request.url),
+        "client_host": request.client.host if request.client else None,
+        "query": dict(request.query_params),
+        "headers": _request_headers_for_bad_request_log(request),
+        "body": (
+            _body_value_for_bad_request_log(
+                body_cache, request.headers.get("content-type", "")
+            )
+            if body_cache is not None
+            else None
+        ),
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 @app.middleware("http")
 async def add_local_timestamps(request: Request, call_next):
     req_ts = _local_iso_timestamp()
@@ -227,6 +289,15 @@ async def add_local_timestamps(request: Request, call_next):
     _api_timestamp_logger.info(
         "[local_ts=%s] Incoming %s %s", req_ts, request.method, request.url.path
     )
+
+    body_cache: Optional[bytes] = None
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        body_cache = await request.body()
+
+        async def receive():
+            return {"type": "http.request", "body": body_cache, "more_body": False}
+
+        request._receive = receive
 
     response = await call_next(request)
     resp_ts = _local_iso_timestamp()
@@ -239,6 +310,13 @@ async def add_local_timestamps(request: Request, call_next):
         request.method,
         request.url.path,
     )
+    if response.status_code == 400:
+        dump = _bad_request_request_dump(request, body_cache)
+        _api_timestamp_logger.warning(
+            "[local_ts=%s] HTTP 400 bad request — request (human-readable JSON):\n%s",
+            resp_ts,
+            dump,
+        )
     return response
 
 # Enable CORS for the Next.js frontend
@@ -251,32 +329,97 @@ app.add_middleware(
 )
 
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    """One turn in the chat history."""
+
+    role: str = Field(
+        ...,
+        description='Message author: typically "user", "assistant", or "system".',
+    )
+    content: str = Field(..., description="Plain-text (or markdown) message body.")
+
+
+class StructuredToolDefinition(BaseModel):
+    """Custom Ollama tool schema when structured_output is true (local models only)."""
+
+    name: str = Field(..., description="Function name the model must call.")
+    description: str = Field("", description="Short description shown to the model.")
+    parameters: Dict[str, Any] = Field(
+        ...,
+        description='JSON Schema for arguments, e.g. {"type":"object","properties":{...},"required":[...]}.',
+    )
+
 
 class ChatRequest(BaseModel):
-    model: str = DEFAULT_CHAT_MODEL
-    messages: List[ChatMessage]
-    thread_id: Optional[str] = None  # optional; when set, conversation is stored per thread for short-term memory
-    instruction: Optional[str] = None  # optional; prepended to the last user message (model input) for this request
-    stream: bool = True  # if false, return one JSON body with the full assistant message
-    cloud: bool = False  # if true, use OpenAI (GPT) or Anthropic (Opus/Sonnet) with API keys from env / .env.local
+    """POST /api/chat JSON body."""
+
+    model: str = Field(
+        DEFAULT_CHAT_MODEL,
+        description=(
+            "Model id. Local: Ollama name (e.g. gpt-oss:20b). Cloud: OpenAI (gpt-…) or Anthropic (claude-…) id; "
+            "provider is inferred from the id unless cloud=true."
+        ),
+    )
+    messages: List[ChatMessage] = Field(
+        ...,
+        description="Full conversation for this request (server trims to last MAX_CONTEXT_MESSAGES).",
+    )
+    thread_id: Optional[str] = Field(
+        None,
+        description="If set, server appends this exchange to in-memory history for that id (GET /api/chat/threads/{thread_id}).",
+    )
+    instruction: Optional[str] = Field(
+        None,
+        description="Optional text prepended to the last user message for this call only (system-style nudge).",
+    )
+    stream: bool = Field(
+        True,
+        description="If true, response is text/plain streamed tokens. If false, JSON object with full assistant message.",
+    )
+    cloud: bool = Field(
+        False,
+        description="If true, use cloud LLM with OPENAI_API_KEY or ANTHROPIC_API_KEY from server env / .env.local.",
+    )
+    structured_output: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Optional; omit or null for false. When true with stream=false, use tool calling for structured output: "
+            "local Ollama (https://docs.ollama.com/capabilities/tool-calling) or cloud OpenAI/Anthropic. "
+            "Response includes structured; with local Ollama set structured_tool for a custom JSON shape."
+        ),
+    )
+    structured_tool: Optional[StructuredToolDefinition] = Field(
+        None,
+        description=(
+            "Optional custom tool (name + JSON Schema parameters) for local Ollama when structured_output is true. "
+            "If omitted, the default deliver_chat_response tool (markdown/math segments) is used. Not supported on cloud."
+        ),
+    )
 
 class CloudChatRequest(BaseModel):
-    provider: str  # "openai", "anthropic", "google"
-    model: str
-    messages: List[ChatMessage]
-    api_key: str
+    """POST /api/cloud/chat — browser-key providers (e.g. Google)."""
+
+    provider: str = Field(
+        ...,
+        description='Cloud id: "openai", "anthropic", or "google".',
+    )
+    model: str = Field(..., description="Provider-specific model id.")
+    messages: List[ChatMessage] = Field(..., description="Chat history for the request.")
+    api_key: str = Field(..., description="API key for this provider (sent from client; not used for server-key OpenAI/Anthropic on /api/chat).")
 
 
 class AddDocumentsRequest(BaseModel):
     """Add texts to the RAG knowledge base. Each string is split into chunks and embedded."""
-    texts: List[str]
+
+    texts: List[str] = Field(
+        ...,
+        description="Non-empty strings to chunk, embed, and add to Chroma (embedding model from RAG_EMBEDDING_MODEL).",
+    )
 
 
 class DeleteChunksRequest(BaseModel):
     """Delete specific chunks from the vector store by their IDs."""
-    ids: List[str]
+
+    ids: List[str] = Field(..., description="Chroma chunk ids to delete (from GET /api/rag/chunks).")
 
 
 # Short-term memory: keep last N messages so context stays focused and within model limits
@@ -611,17 +754,42 @@ async def _anthropic_chat_complete_messages(model: str, messages: List[ChatMessa
         )
 
 
-@app.post("/api/chat")
+@app.post(
+    "/api/chat",
+    summary="Chat completion",
+    response_description=(
+        "If stream=true: text/plain body streamed incrementally. "
+        "If stream=false: JSON with message and model; if structured_output, structured "
+        "(segments for default tool, or tool_name/arguments for Ollama structured_tool)."
+    ),
+)
 async def chat_completion(request: ChatRequest):
+    """Run chat against **local Ollama** or **cloud OpenAI/Anthropic** (server API keys).
+
+    **Routing:** If `model` looks like a cloud id (e.g. `gpt-4o`, `claude-sonnet-4-6`) or `cloud` is true,
+    the request uses env keys `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`. Otherwise Ollama is used; non-default
+    models must already be loaded (`POST /api/models/load`).
+
+    **structured_output** with `stream=false`: uses tool calling — Ollama (see ollama.com tool calling docs)
+    or cloud OpenAI/Anthropic. Local default tool is `deliver_chat_response` (segments); set **structured_tool**
+    for a custom JSON schema. **structured_tool** is not supported on cloud.
+    """
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
     messages = _trim_messages(messages)
     messages = _apply_instruction_to_last_user(messages, request.instruction)
     thread_id = request.thread_id
 
+    want_structured_output = bool(request.structured_output)
+
     inferred_cloud = _infer_cloud_provider_from_model_id(request.model)
     use_cloud_llm = bool(request.cloud) or (inferred_cloud is not None)
 
     if use_cloud_llm:
+        if request.structured_tool is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="structured_tool is only supported with local Ollama (use cloud=false and a local model id).",
+            )
         provider = inferred_cloud if inferred_cloud is not None else _cloud_provider_for_model(request.model)
         if provider == "openai":
             api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -652,8 +820,35 @@ async def chat_completion(request: ChatRequest):
             api_key=api_key,
         )
 
+        if want_structured_output and request.stream:
+            raise HTTPException(
+                status_code=400,
+                detail="structured_output requires stream=false (tool calls are not used on the streaming path).",
+            )
+
         if not request.stream:
             try:
+                if want_structured_output:
+                    cloud_dicts = [{"role": m.role, "content": m.content} for m in chat_messages]
+                    if provider == "openai":
+                        full_content, segments = await openai_structured_complete(
+                            request.model, cloud_dicts, api_key
+                        )
+                    else:
+                        full_content, segments = await anthropic_structured_complete(
+                            request.model, cloud_dicts, api_key
+                        )
+                    if thread_id:
+                        stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+                        stored.append({"role": "assistant", "content": full_content})
+                        _thread_store[thread_id] = stored
+                    return {
+                        "message": {"role": "assistant", "content": full_content},
+                        "structured": {"segments": segments},
+                        "model": request.model,
+                        "cloud": True,
+                        "provider": provider,
+                    }
                 if provider == "openai":
                     full_content = await _openai_chat_complete_messages(
                         request.model, chat_messages, api_key
@@ -674,6 +869,13 @@ async def chat_completion(request: ChatRequest):
                 }
             except HTTPException:
                 raise
+            except (json.JSONDecodeError, ValueError) as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Structured tool response could not be parsed: {e}",
+                )
+            except RuntimeError as e:
+                raise HTTPException(status_code=502, detail=str(e))
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
 
@@ -713,6 +915,45 @@ async def chat_completion(request: ChatRequest):
                 ),
             )
 
+    if want_structured_output:
+        if request.stream:
+            raise HTTPException(
+                status_code=400,
+                detail="structured_output requires stream=false (Ollama tool calling is non-streaming).",
+            )
+        try:
+            try:
+                rag_msgs = _messages_for_cloud_chat_with_rag(messages)
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+            api_msgs = [{"role": m["role"], "content": str(m.get("content") or "")} for m in rag_msgs]
+            custom_tool = (
+                request.structured_tool.model_dump() if request.structured_tool is not None else None
+            )
+            full_content, structured = await ollama_structured_chat_complete(
+                request.model,
+                api_msgs,
+                custom_tool=custom_tool,
+                keep_alive=OLLAMA_KEEP_ALIVE,
+            )
+            if thread_id:
+                stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+                stored.append({"role": "assistant", "content": full_content})
+                _thread_store[thread_id] = stored
+            return {
+                "message": {"role": "assistant", "content": full_content},
+                "structured": structured,
+                "model": request.model,
+            }
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     if not request.stream:
         try:
             full_content = await _ollama_chat_complete_text(request.model, messages)
@@ -747,8 +988,16 @@ async def chat_completion(request: ChatRequest):
     return StreamingResponse(generate_response(), media_type="text/plain")
 
 
-@app.get("/api/chat/threads/{thread_id}")
-def get_thread_messages(thread_id: str):
+@app.get(
+    "/api/chat/threads/{thread_id}",
+    summary="Get stored messages for a thread",
+)
+def get_thread_messages(
+    thread_id: Annotated[
+        str,
+        Path(description="Same value as `thread_id` sent on POST /api/chat."),
+    ],
+):
     """Return stored short-term memory (message history) for a thread, if any."""
     if thread_id not in _thread_store:
         return {"messages": []}
@@ -889,8 +1138,13 @@ CLOUD_STREAMERS = {
 }
 
 
-@app.post("/api/cloud/chat")
+@app.post(
+    "/api/cloud/chat",
+    summary="Stream chat (client API key)",
+    response_description="text/plain streamed tokens (same as streaming /api/chat).",
+)
 async def cloud_chat(request: CloudChatRequest):
+    """Stream from OpenAI, Anthropic, or **Google** using the **client-supplied** `api_key` (e.g. browser)."""
     if request.provider not in CLOUD_STREAMERS:
         raise HTTPException(status_code=400, detail=f"Unknown provider: {request.provider}")
     if not request.api_key:
@@ -902,6 +1156,109 @@ async def cloud_chat(request: CloudChatRequest):
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "message": "Backend is running!"}
+
+
+def _api_usage_guide_html() -> str:
+    """Static HTML overview of endpoints and parameters (complements OpenAPI schemas below)."""
+    return """
+  <section class="guide" id="api-usage-guide" aria-label="How to use this API">
+    <h2>How to use this API</h2>
+    <p class="muted">
+      Use <code>Content-Type: application/json</code> for JSON bodies. Default base URL when developing is
+      <code>http://localhost:8000</code>. Interactive docs: <a href="/docs">/docs</a> (Swagger),
+      <a href="/redoc">/redoc</a> (ReDoc).
+    </p>
+
+    <h3>Chat</h3>
+    <table class="guide">
+      <thead><tr><th>Method &amp; path</th><th>Purpose</th><th>Key inputs</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>POST /api/chat</code></td>
+          <td>Main chat: local Ollama or cloud OpenAI/Anthropic (server env keys).</td>
+          <td>
+            <strong>model</strong> — Ollama id or cloud model id.<br/>
+            <strong>messages</strong> — <code>[{ "role", "content" }]</code>.<br/>
+            <strong>stream</strong> — <code>true</code> → <code>text/plain</code> stream;
+            <code>false</code> → JSON <code>message</code>, <code>model</code>, and if cloud <code>provider</code>.<br/>
+            <strong>cloud</strong> — force cloud when model id is ambiguous.<br/>
+            <strong>thread_id</strong> — optional; server stores last messages per id (see GET thread).<br/>
+            <strong>instruction</strong> — optional; prepended to last user message for this request only.<br/>
+            <strong>structured_output</strong> — optional JSON field; omit or null for false. With
+            <code>stream: false</code>, uses tool calling (local Ollama or cloud OpenAI/Anthropic).
+            Default tool: <code>deliver_chat_response</code> → <code>structured.segments</code>.
+            <strong>structured_tool</strong> — optional (local Ollama only): custom <code>name</code> +
+            JSON Schema <code>parameters</code> → <code>structured.tool_name</code> +
+            <code>structured.arguments</code>.
+          </td>
+        </tr>
+        <tr>
+          <td><code>POST /api/cloud/chat</code></td>
+          <td>Stream chat using the <strong>client</strong> <code>api_key</code> (e.g. Google Gemini in the browser).</td>
+          <td>
+            <strong>provider</strong> — <code>openai</code> | <code>anthropic</code> | <code>google</code>.<br/>
+            <strong>model</strong>, <strong>messages</strong>, <strong>api_key</strong>.
+          </td>
+        </tr>
+        <tr>
+          <td><code>GET /api/chat/threads/{thread_id}</code></td>
+          <td>Return stored messages for a thread (if any).</td>
+          <td>Path: <strong>thread_id</strong> — same as sent in <code>POST /api/chat</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>RAG (knowledge base)</h3>
+    <table class="guide">
+      <thead><tr><th>Method &amp; path</th><th>Purpose</th><th>Key inputs</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>POST /api/rag/documents</code></td>
+          <td>Add plain texts (chunked + embedded).</td>
+          <td>Body: <code>{ "texts": ["..."] }</code></td>
+        </tr>
+        <tr>
+          <td><code>POST /api/rag/documents/files</code></td>
+          <td>Upload <code>.md</code> / <code>.txt</code> files (multipart).</td>
+          <td>Form field <code>files</code> — one or more files.</td>
+        </tr>
+        <tr>
+          <td><code>GET /api/rag/status</code></td>
+          <td>Collection stats / embedding model.</td>
+          <td>No parameters.</td>
+        </tr>
+        <tr>
+          <td><code>GET /api/rag/chunks</code></td>
+          <td>List stored chunks (paginated).</td>
+          <td>Query: <strong>limit</strong> (1–2000, default 500), <strong>offset</strong> (default 0).</td>
+        </tr>
+        <tr>
+          <td><code>DELETE /api/rag/chunks</code></td>
+          <td>Delete chunks by id.</td>
+          <td>Body: <code>{ "ids": ["..."] }</code></td>
+        </tr>
+        <tr>
+          <td><code>DELETE /api/rag/storage</code></td>
+          <td>Wipe the whole vector store.</td>
+          <td>No body.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Ollama models &amp; system</h3>
+    <table class="guide">
+      <thead><tr><th>Method &amp; path</th><th>Purpose</th><th>Key inputs</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/models</code></td><td>List installed Ollama models.</td><td>—</td></tr>
+        <tr><td><code>GET /api/models/loaded</code></td><td>Models currently in memory.</td><td>—</td></tr>
+        <tr><td><code>POST /api/models/load</code></td><td>Load a model.</td><td>Body: <code>{ "model": "..." }</code></td></tr>
+        <tr><td><code>POST /api/models/stop</code></td><td>Stop a model.</td><td>Body: <code>{ "model": "..." }</code></td></tr>
+        <tr><td><code>GET /api/sysinfo</code></td><td>Host memory stats.</td><td>—</td></tr>
+        <tr><td><code>GET /api/health</code></td><td>Liveness.</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </section>
+"""
 
 
 def _deref_openapi_schema(openapi: dict, obj: object, depth: int = 0) -> object:
@@ -954,17 +1311,26 @@ def _openapi_paths_to_html(openapi: dict) -> str:
 
             params = op.get("parameters") or []
             if params:
-                parts.append("<h3>Parameters</h3><table><thead><tr><th>Name</th><th>In</th><th>Required</th><th>Schema</th></tr></thead><tbody>")
+                parts.append(
+                    "<h3>Parameters</h3><table><thead><tr><th>Name</th><th>In</th><th>Required</th>"
+                    "<th>Description</th><th>Schema</th></tr></thead><tbody>"
+                )
                 for p in params:
                     if not isinstance(p, dict):
                         continue
                     name = html.escape(str(p.get("name", "")))
                     inn = html.escape(str(p.get("in", "")))
                     req = "yes" if p.get("required") else "no"
+                    pdesc_raw = (p.get("description") or "").strip()
+                    pdesc = html.escape(pdesc_raw) if pdesc_raw else "—"
                     sch = p.get("schema") or {}
                     parts.append(
-                        "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                            name, inn, req, html.escape(json.dumps(sch, ensure_ascii=False)),
+                        "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                            name,
+                            inn,
+                            req,
+                            pdesc,
+                            html.escape(json.dumps(sch, ensure_ascii=False)),
                         )
                     )
                 parts.append("</tbody></table>")
@@ -1011,7 +1377,9 @@ def _build_api_documentation_page(openapi: dict) -> str:
     version = html.escape(str(info.get("version", "")))
     desc = (info.get("description") or "").strip()
 
-    nav_paths = []
+    nav_paths = [
+        '<li><a href="#api-usage-guide">Guide — parameters &amp; usage</a></li>'
+    ]
     paths = openapi.get("paths") or {}
     for path in sorted(paths.keys()):
         path_item = paths[path] or {}
@@ -1028,6 +1396,7 @@ def _build_api_documentation_page(openapi: dict) -> str:
 
     body = _openapi_paths_to_html(openapi)
     nav = "\n".join(nav_paths)
+    usage_guide = _api_usage_guide_html()
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1082,7 +1451,20 @@ def _build_api_documentation_page(openapi: dict) -> str:
     section.op h2 code {{ color: #79c0ff; }}
     section.op h3 {{ font-size: 1rem; margin-top: 1.25rem; color: var(--fg); }}
     section.op h4 {{ font-size: 0.95rem; margin: 0.75rem 0 0.25rem; color: var(--muted); }}
-    .summary {{ font-weight: 600; margin: 0.5rem 002; }}
+    .summary {{ font-weight: 600; margin: 0.5rem 0 0; }}
+    section.guide {{
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 2rem;
+      background: #0d1117;
+    }}
+    section.guide h2 {{ margin-top: 0; font-size: 1.2rem; }}
+    section.guide h3 {{ font-size: 1rem; margin-top: 1.25rem; margin-bottom: 0.5rem; }}
+    table.guide {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 0.35rem; }}
+    table.guide th, table.guide td {{ border: 1px solid var(--border); padding: 0.5rem 0.65rem; text-align: left; vertical-align: top; }}
+    table.guide th {{ background: #21262d; }}
+    table.guide code {{ font-size: 0.88em; }}
     .desc {{ white-space: pre-wrap; color: var(--muted); font-size: 0.9rem; margin: 0.5rem 0; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
     th, td {{ border: 1px solid var(--border); padding: 0.45rem 0.6rem; text-align: left; vertical-align: top; }}
@@ -1103,9 +1485,11 @@ def _build_api_documentation_page(openapi: dict) -> str:
     <h1>{title}</h1>
     <p class="muted">OpenAPI {version} — generated from registered routes (inputs &amp; response schemas).</p>
     <p class="intro">Also available: <a href="/docs">Swagger UI (/docs)</a> · <a href="/redoc">ReDoc (/redoc)</a> ·
-      <a href="/api/documentation?export=json">this page as JSON</a> (<code>/openapi.json</code>)</p>
+      <a href="/api/documentation?export=json">this page as JSON</a> (<code>/openapi.json</code>) ·
+      <a href="/api/doc">/api/doc</a> (alias)</p>
   </header>
   {(f'<p class="desc">{html.escape(desc)}</p>' if desc else '')}
+  {usage_guide}
   <nav class="toc" aria-label="Endpoints">
     <strong style="display:block;margin-bottom:0.5rem">Endpoints</strong>
     <ul>{nav}</ul>
@@ -1122,6 +1506,12 @@ async def api_documentation(request: Request, export: Optional[str] = None):
     if export and export.strip().lower() == "json":
         return JSONResponse(schema)
     return HTMLResponse(_build_api_documentation_page(schema))
+
+
+@app.get("/api/doc", include_in_schema=False)
+async def api_doc_alias():
+    """Same documentation as <code>/api/documentation</code> (permanent redirect)."""
+    return RedirectResponse(url="/api/documentation", status_code=308)
 
 
 @app.post("/api/rag/documents")
@@ -1170,7 +1560,20 @@ async def rag_status():
 
 
 @app.get("/api/rag/chunks")
-async def rag_list_chunks(limit: int = 500, offset: int = 0):
+async def rag_list_chunks(
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=2000,
+            description="Maximum chunks to return (server caps at 2000).",
+        ),
+    ] = 500,
+    offset: Annotated[
+        int,
+        Query(ge=0, description="Number of chunks to skip (pagination)."),
+    ] = 0,
+):
     """List chunks in the vector store for browsing. Returns id, content preview, and metadata."""
     try:
         vs = _get_vector_store()
@@ -1275,10 +1678,14 @@ async def rag_add_files(files: List[UploadFile] = File(...)):
 
 
 class StopModelRequest(BaseModel):
-    model: str
+    model: str = Field(..., description="Ollama model name to unload (runs `ollama stop`).")
+
 
 class LoadModelRequest(BaseModel):
-    model: str
+    model: str = Field(
+        ...,
+        description="Ollama model to load and keep resident (chat or embedding model).",
+    )
 
 @app.get("/api/models")
 async def get_models():
