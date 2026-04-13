@@ -8,9 +8,13 @@ arguments are already structured (dict), avoiding fragile free-form JSON in assi
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ollama
+
+_log = logging.getLogger("uvicorn.error")
 
 from structured_chat import (
     DELIVER_CHAT_RESPONSE_SCHEMA,
@@ -102,6 +106,7 @@ async def ollama_structured_chat_complete(
         default_tool_name = TOOL_NAME
 
     client = ollama.AsyncClient()
+    t0 = time.perf_counter()
     resp = await client.chat(
         model=model,
         messages=msgs,
@@ -109,6 +114,12 @@ async def ollama_structured_chat_complete(
         stream=False,
         keep_alive=keep_alive,
     )
+    wall_s = time.perf_counter() - t0
+    info = resp.model_dump() if hasattr(resp, "model_dump") else {}
+    td = info.get("total_duration")
+    ed = info.get("eval_duration")
+    ld = info.get("load_duration")
+    ped = info.get("prompt_eval_duration")
 
     message = resp.message
     tcalls = message.tool_calls
@@ -122,12 +133,34 @@ async def ollama_structured_chat_complete(
             if tname != default_tool_name:
                 raise ValueError(f"expected tool {default_tool_name!r}, got {tname!r}")
             text = json.dumps(args, ensure_ascii=False)
+            _log.info(
+                "Ollama structured_output finished: model=%s tool=%s (custom JSON schema) wall_s=%.3f "
+                "ollama_total_ms=%.2f ollama_eval_ms=%.2f ollama_load_ms=%.2f ollama_prompt_eval_ms=%.2f",
+                model,
+                tname,
+                wall_s,
+                (td or 0) / 1e6,
+                (ed or 0) / 1e6,
+                (ld or 0) / 1e6,
+                (ped or 0) / 1e6,
+            )
             return text, {"tool_name": tname, "arguments": args}
 
         if tname != TOOL_NAME:
             raise ValueError(f"expected tool {TOOL_NAME!r}, got {tname!r}")
         segments = normalize_segments(args)
         md = segments_to_markdown(segments)
+        _log.info(
+            "Ollama structured_output finished: model=%s tool=%s (JSON segments to markdown) wall_s=%.3f "
+            "ollama_total_ms=%.2f ollama_eval_ms=%.2f ollama_load_ms=%.2f ollama_prompt_eval_ms=%.2f",
+            model,
+            tname,
+            wall_s,
+            (td or 0) / 1e6,
+            (ed or 0) / 1e6,
+            (ld or 0) / 1e6,
+            (ped or 0) / 1e6,
+        )
         return md, {"segments": segments}
 
     # No tool call: surface model text if present (easier debugging)

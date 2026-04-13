@@ -15,6 +15,7 @@ import psutil
 import subprocess
 import httpx
 import json
+import time
 
 # Ollama chat uses LangChain ChatOllama (token-level streaming, native async).
 # See: https://docs.langchain.com/oss/python/integrations/chat/ollama
@@ -554,6 +555,74 @@ def _ollama_chat_sampling_kwargs(model: str) -> dict:
     return {"temperature": 0}
 
 
+def _gemma4_wall_think_answer_from_raw(raw: str, wall_total_s: float) -> tuple[float, float]:
+    """Approximate wall time spent in thought channel vs public answer by Gemma 4 marker positions."""
+    if not raw or wall_total_s <= 0:
+        return 0.0, wall_total_s
+    si = raw.find(GEMMA4_THOUGHT_START)
+    if si == -1:
+        return 0.0, wall_total_s
+    ei = raw.find(GEMMA4_THOUGHT_END, si + len(GEMMA4_THOUGHT_START))
+    if ei == -1:
+        return wall_total_s, 0.0
+    after = ei + len(GEMMA4_THOUGHT_END)
+    thought_len = max(0, after)
+    answer_len = max(0, len(raw) - after)
+    denom = max(1, thought_len + answer_len)
+    return wall_total_s * thought_len / denom, wall_total_s * answer_len / denom
+
+
+def _gemma4_eval_think_answer_from_raw(raw: str, eval_ns: Optional[int]) -> tuple[Optional[float], Optional[float]]:
+    """Split Ollama eval_duration (ns) between thought and answer using character lengths inside markers."""
+    if not isinstance(eval_ns, int) or eval_ns <= 0 or not raw:
+        return None, None
+    si = raw.find(GEMMA4_THOUGHT_START)
+    if si == -1:
+        return None, float(eval_ns) / 1e9
+    ei = raw.find(GEMMA4_THOUGHT_END, si + len(GEMMA4_THOUGHT_START))
+    if ei == -1:
+        return float(eval_ns) / 1e9, None
+    after = ei + len(GEMMA4_THOUGHT_END)
+    thought_len = max(0, after)
+    answer_len = max(0, len(raw) - after)
+    denom = max(1, thought_len + answer_len)
+    return (eval_ns * thought_len / denom) / 1e9, (eval_ns * answer_len / denom) / 1e9
+
+
+def _log_ollama_chat_finished(
+    *,
+    model: str,
+    thinking_enabled: bool,
+    streaming: bool,
+    wall_total_s: float,
+    wall_think_s: Optional[float],
+    wall_answer_s: Optional[float],
+    ollama_eval_think_s: Optional[float],
+    ollama_eval_answer_s: Optional[float],
+    response_metadata: Optional[dict],
+) -> None:
+    parts = [
+        f"model={model!r}",
+        f"streaming={streaming}",
+        f"thinking_request={thinking_enabled}",
+        f"wall_total_s={wall_total_s:.3f}",
+    ]
+    if wall_think_s is not None:
+        parts.append(f"wall_think_s={wall_think_s:.3f}")
+    if wall_answer_s is not None:
+        parts.append(f"wall_answer_s={wall_answer_s:.3f}")
+    if ollama_eval_think_s is not None:
+        parts.append(f"ollama_eval_think_s={ollama_eval_think_s:.3f}")
+    if ollama_eval_answer_s is not None:
+        parts.append(f"ollama_eval_answer_s={ollama_eval_answer_s:.3f}")
+    rm = response_metadata or {}
+    for key in ("total_duration", "eval_duration", "load_duration", "prompt_eval_duration"):
+        ns = rm.get(key)
+        if isinstance(ns, (int, float)) and ns > 0:
+            parts.append(f"ollama_{key}_ms={ns / 1e6:.2f}")
+    _api_timestamp_logger.info("Ollama chat finished: %s", " ".join(parts))
+
+
 def _strip_gemma4_public_answer(text: str) -> str:
     """Remove Gemma 4 internal thought blocks; keep only content after the closing marker."""
     if not text:
@@ -570,15 +639,31 @@ def _strip_gemma4_public_answer(text: str) -> str:
     return s
 
 
-async def _stream_strip_gemma4_thought(achunk_stream):
+async def _stream_strip_gemma4_thought(
+    achunk_stream,
+    *,
+    timing: Optional[dict] = None,
+    ollama_meta: Optional[list] = None,
+):
     """Buffer until the first thought block closes, then stream deltas (public answer only)."""
     buf = ""
     past = False
+    raw_parts: list[str] = []
+
+    def _note_first_public() -> None:
+        if timing is not None and "t_first_public" not in timing:
+            timing["t_first_public"] = time.perf_counter()
+
     async for chunk in achunk_stream:
+        rm = getattr(chunk, "response_metadata", None) or {}
+        if rm and ollama_meta is not None:
+            ollama_meta[0] = rm
         c = getattr(chunk, "content", None) or ""
+        raw_parts.append(c)
         if not c:
             continue
         if past:
+            _note_first_public()
             yield c
             continue
         buf += c
@@ -590,9 +675,13 @@ async def _stream_strip_gemma4_thought(achunk_stream):
                 tail = buf[ei + len(GEMMA4_THOUGHT_END) :]
                 buf = ""
                 if tail:
+                    _note_first_public()
                     yield tail
     if not past and buf:
+        _note_first_public()
         yield _strip_gemma4_public_answer(buf)
+    if timing is not None:
+        timing["raw_model_output"] = "".join(raw_parts)
 
 
 def _apply_instruction_to_last_user(messages: List[dict], instruction: Optional[str]) -> List[dict]:
@@ -647,11 +736,25 @@ def _build_ollama_lc_messages_with_rag(
     first_system = SystemMessage(content=rag_system)
     if thinking and _is_gemma4_model(model):
         first_system = SystemMessage(content=f"{GEMMA4_THINK_TRIGGER}\n{rag_system}")
+        _api_timestamp_logger.info(
+            "Gemma 4 thinking enabled for model=%s: <|think|> prepended to RAG system message.",
+            model,
+        )
     return [first_system] + lc_messages
 
 
-async def _ollama_chat_stream_chunks(model: str, messages: List[dict], *, thinking: bool = False):
-    """Yields text tokens from ChatOllama (RAG + streaming)."""
+async def _ollama_chat_stream_chunks(
+    model: str,
+    messages: List[dict],
+    *,
+    thinking: bool = False,
+    timing: Optional[dict] = None,
+):
+    """Yields text tokens from ChatOllama (RAG + streaming).
+
+    If ``timing`` is a dict, it is filled with: ``t_start``, ``t_end``, ``t_first_public`` (perf_counter
+    values), and ``ollama_response_metadata`` (last chunk's ``response_metadata`` from LangChain).
+    """
     lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model)
     llm = ChatOllama(
         model=model,
@@ -659,13 +762,29 @@ async def _ollama_chat_stream_chunks(model: str, messages: List[dict], *, thinki
         **_ollama_chat_sampling_kwargs(model),
     )
     stream = llm.astream(lc_messages)
+    t_start = time.perf_counter()
+    if timing is not None:
+        timing["t_start"] = t_start
+    ollama_meta: list = [None]
     if _is_gemma4_model(model):
-        async for part in _stream_strip_gemma4_thought(stream):
+        async for part in _stream_strip_gemma4_thought(stream, timing=timing, ollama_meta=ollama_meta):
             yield part
     else:
+        raw_parts: list[str] = []
         async for chunk in stream:
+            rm = getattr(chunk, "response_metadata", None) or {}
+            if rm:
+                ollama_meta[0] = rm
+            raw_parts.append(chunk.content or "")
             if chunk.content:
+                if timing is not None and "t_first_public" not in timing:
+                    timing["t_first_public"] = time.perf_counter()
                 yield chunk.content
+        if timing is not None:
+            timing["raw_model_output"] = "".join(raw_parts)
+    if timing is not None:
+        timing["t_end"] = time.perf_counter()
+        timing["ollama_response_metadata"] = ollama_meta[0]
 
 
 def _assistant_content_from_invoke(result) -> str:
@@ -693,8 +812,29 @@ async def _ollama_chat_complete_text(model: str, messages: List[dict], *, thinki
         keep_alive=OLLAMA_KEEP_ALIVE,
         **_ollama_chat_sampling_kwargs(model),
     )
+    t0 = time.perf_counter()
     result = await llm.ainvoke(lc_messages)
+    t1 = time.perf_counter()
     raw = _assistant_content_from_invoke(result)
+    rm = getattr(result, "response_metadata", None) or {}
+    eval_ns = rm.get("eval_duration")
+    if _is_gemma4_model(model):
+        wall_think, wall_answer = _gemma4_wall_think_answer_from_raw(raw, t1 - t0)
+        ev_think, ev_answer = _gemma4_eval_think_answer_from_raw(raw, eval_ns if isinstance(eval_ns, int) else None)
+    else:
+        wall_think, wall_answer = None, t1 - t0
+        ev_think, ev_answer = None, None
+    _log_ollama_chat_finished(
+        model=model,
+        thinking_enabled=thinking,
+        streaming=False,
+        wall_total_s=t1 - t0,
+        wall_think_s=wall_think,
+        wall_answer_s=wall_answer,
+        ollama_eval_think_s=ev_think,
+        ollama_eval_answer_s=ev_answer,
+        response_metadata=rm,
+    )
     if _is_gemma4_model(model):
         return _strip_gemma4_public_answer(raw)
     return raw
@@ -1052,12 +1192,49 @@ async def chat_completion(request: ChatRequest):
 
     async def generate_response():
         full_content = ""
+        timing: dict = {}
         try:
             async for part in _ollama_chat_stream_chunks(
-                request.model, messages, thinking=bool(request.thinking)
+                request.model,
+                messages,
+                thinking=bool(request.thinking),
+                timing=timing,
             ):
                 full_content += part
                 yield part
+            t_end = timing.get("t_end", time.perf_counter())
+            t_start = timing.get("t_start", t_end)
+            t_first = timing.get("t_first_public")
+            wall_total = max(0.0, t_end - t_start)
+            rm = timing.get("ollama_response_metadata") or {}
+            eval_ns = rm.get("eval_duration")
+            raw = timing.get("raw_model_output") or ""
+            if _is_gemma4_model(request.model):
+                if t_first is not None:
+                    wall_think = max(0.0, t_first - t_start)
+                    wall_answer = max(0.0, t_end - t_first)
+                else:
+                    wall_think = 0.0
+                    wall_answer = wall_total
+                ev_think, ev_answer = _gemma4_eval_think_answer_from_raw(
+                    raw,
+                    eval_ns if isinstance(eval_ns, int) else None,
+                )
+            else:
+                wall_think = None
+                wall_answer = wall_total
+                ev_think, ev_answer = None, None
+            _log_ollama_chat_finished(
+                model=request.model,
+                thinking_enabled=bool(request.thinking),
+                streaming=True,
+                wall_total_s=wall_total,
+                wall_think_s=wall_think,
+                wall_answer_s=wall_answer,
+                ollama_eval_think_s=ev_think,
+                ollama_eval_answer_s=ev_answer,
+                response_metadata=rm,
+            )
             if thread_id:
                 stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
                 stored.append({"role": "assistant", "content": full_content})
@@ -1841,7 +2018,18 @@ async def ollama_verify_tools_json(model: Optional[str] = None):
                 ),
             )
     try:
-        return await run_ollama_tools_json_verification(m)
+        _api_timestamp_logger.info(
+            "Ollama verify-tools-json: running tool calling + JSON-schema (LaTeX) checks (model=%s).", m
+        )
+        t0 = time.perf_counter()
+        out = await run_ollama_tools_json_verification(m)
+        _api_timestamp_logger.info(
+            "Ollama verify-tools-json finished: model=%s wall_s=%.3f all_ok=%s",
+            m,
+            time.perf_counter() - t0,
+            out.get("all_ok"),
+        )
+        return out
     except HTTPException:
         raise
     except Exception as e:
