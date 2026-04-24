@@ -29,6 +29,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from logging_setup import configure_app_logging
 from ollama_structured import ollama_structured_chat_complete
 from structured_chat import anthropic_structured_complete, openai_structured_complete
+from agents import agents_router
 
 # ChromaDB persist directory under project root / database
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -166,6 +167,8 @@ app = FastAPI(
 )
 
 configure_app_logging(_BASE_DIR)
+
+app.include_router(agents_router)
 
 
 def _configure_access_log_filter() -> None:

@@ -2,5 +2,8 @@
   "local_models":["gemma4:26b","gemma4:e4b"],
   "cloud_models":["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano"],
   "thinking_models":["gemma4:26b","gemma4:e4b"],
-  "reasoning_models":["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano"]
+  "reasoning_models":["gpt-5.4","gpt-5.4-mini","gpt-5.4-nano"],
+  "insertion_agent":["gemma4:26b"],
+  "education_agent":["gemma4:26b"],
+  "embedding_model":["qwen3-embedding:8b"]
 }
