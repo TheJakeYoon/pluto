@@ -26,6 +26,7 @@ from langchain_ollama import ChatOllama
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
+from json_response_repair import apply_json_response_middleware
 from logging_setup import configure_app_logging
 from ollama_structured import ollama_structured_chat_complete
 from structured_chat import anthropic_structured_complete, openai_structured_complete
@@ -322,6 +323,7 @@ async def add_local_timestamps(request: Request, call_next):
             request._receive = receive
 
     response = await call_next(request)
+    response = apply_json_response_middleware(response)
     resp_ts = _local_iso_timestamp()
     response.headers["X-Request-Local-Time"] = req_ts
     response.headers["X-Response-Local-Time"] = resp_ts
@@ -373,11 +375,21 @@ def _openai_reasoning_effort_optional(val: OpenAIReasoningEffort) -> Optional[st
 class StructuredToolDefinition(BaseModel):
     """Custom Ollama tool schema when structured_output is true (local models only)."""
 
-    name: str = Field(..., description="Function name the model must call.")
-    description: str = Field("", description="Short description shown to the model.")
+    name: str = Field(
+        ...,
+        description="Function name the model must call (must match tool_choice / OpenAI function name).",
+    )
+    description: str = Field(
+        "",
+        description="Short description injected into the system prompt so the model knows how to fill arguments.",
+    )
     parameters: Dict[str, Any] = Field(
         ...,
-        description='JSON Schema for arguments, e.g. {"type":"object","properties":{...},"required":[...]}.',
+        description=(
+            "JSON Schema object for tool arguments (OpenAI-style parameters). Response JSON is validated only by "
+            "the provider; use structured_output with clear required fields. Example shape: "
+            '{"type":"object","properties":{...},"required":[...],"additionalProperties":false}.'
+        ),
     )
 
 
@@ -387,8 +399,9 @@ class ChatRequest(BaseModel):
     model: str = Field(
         DEFAULT_CHAT_MODEL,
         description=(
-            "Model id. Local: Ollama name (e.g. gpt-oss:20b). Cloud: OpenAI (gpt-…) or Anthropic (claude-…) id; "
-            "provider is inferred from the id unless cloud=true."
+            "Model id. Local: Ollama name (see GET /api/models for installed ids). Cloud: OpenAI (gpt-/o-…) or "
+            "Anthropic (claude-…) id; provider is inferred from the id unless cloud=true. When omitted, the server "
+            "uses settings.json: default_chat_model, else the first entry in local_models, else gpt-oss:20b."
         ),
     )
     messages: List[ChatMessage] = Field(
@@ -414,31 +427,38 @@ class ChatRequest(BaseModel):
     thinking: bool = Field(
         True,
         description=(
-            "Ollama (local): passed to LangChain ``ChatOllama`` as ``reasoning`` for non-Gemma models (enables "
-            "Ollama thinking/reasoning API). Gemma 4: when true, prepends <|think|> on the RAG system message and "
-            "streamed replies strip hidden thought; structured_output uses ``reasoning=false`` only when thinking is false."
+            "Ollama (local) only; ignored for cloud. Maps to LangChain ChatOllama: for non-Gemma models, passed as "
+            "invoke/stream kwarg reasoning (bool) so Ollama exposes thinking per https://ollama.com/search?c=thinking . "
+            "Gemma 4: when true, <|think|> is prepended on the RAG system block and the server strips the thought "
+            "channel from streamed/plain text; when structured_output is true, reasoning=false is sent to Ollama only "
+            "if thinking is false (reliable tool JSON)."
         ),
     )
     reasoning: OpenAIReasoningEffort = Field(
         None,
         description=(
-            "OpenAI (cloud only): maps to LangChain ``ChatOpenAI.reasoning_effort`` for reasoning models "
-            "(omit when null or ``none``; ``low`` | ``medium`` | ``high`` | ``xhigh`` sent as-is)."
+            "OpenAI when cloud=true or when the model id routes to OpenAI; ignored for Anthropic. Sent as LangChain "
+            "ChatOpenAI.reasoning_effort. Use null or \"none\" to omit (default API behavior). "
+            "Values \"low\" | \"medium\" | \"high\" | \"xhigh\" are forwarded for reasoning-capable models; unsupported "
+            "combinations return an upstream error. With structured_output, LangChain uses the Responses API when "
+            "reasoning is set (required for tool calls + reasoning on models such as gpt-5.4-nano)."
         ),
     )
     structured_output: Optional[bool] = Field(
         default=None,
         description=(
-            "Optional; omit or null for false. When true with stream=false, use LangChain structured output (forced tool / function calling): "
-            "local Ollama (https://docs.ollama.com/capabilities/tool-calling) or cloud OpenAI/Anthropic. "
-            "Response includes structured; with local Ollama set structured_tool for a custom JSON shape."
+            "When true, requires stream=false. Uses LangChain with_structured_output (function-calling / forced tool) "
+            "so the assistant reply is parsed from tool arguments (reduces invalid JSON in prose). Default tool "
+            "deliver_chat_response returns structured.segments (markdown + math_inline + math_display). "
+            "Cloud: OpenAI via LangChain; Anthropic via native tools API. Local Ollama: see structured_tool."
         ),
     )
     structured_tool: Optional[StructuredToolDefinition] = Field(
         None,
         description=(
-            "Optional custom tool (name + JSON Schema parameters) for local Ollama when structured_output is true. "
-            "If omitted, the default deliver_chat_response tool (markdown/math segments) is used. Not supported on cloud."
+            "Local Ollama only (structured_output true). Replaces the default deliver_chat_response tool with your "
+            "own name + JSON Schema; response JSON includes structured.tool_name and structured.arguments. "
+            "Not allowed with cloud=true."
         ),
     )
 
@@ -454,7 +474,7 @@ class CloudChatRequest(BaseModel):
     api_key: str = Field(..., description="API key for this provider (sent from client; not used for server-key OpenAI/Anthropic on /api/chat).")
     reasoning: OpenAIReasoningEffort = Field(
         None,
-        description="OpenAI only: same values as POST /api/chat ``reasoning`` → LangChain ``ChatOpenAI.reasoning_effort``.",
+        description='OpenAI with provider "openai" only: same as POST /api/chat reasoning → ChatOpenAI.reasoning_effort.',
     )
 
 
@@ -1068,7 +1088,7 @@ async def chat_completion(request: ChatRequest):
     local Ollama (see ollama.com tool calling) or cloud OpenAI/Anthropic. Default tool is `deliver_chat_response` (segments); set **structured_tool**
     for a custom JSON schema. **structured_tool** is not supported on cloud.
 
-    **thinking** (Ollama) and **reasoning** (OpenAI cloud): see field descriptions; both map into LangChain chat models.
+    **thinking** (Ollama) and **reasoning** (OpenAI): see <code>/api/documentation</code> → <em>Thinking vs reasoning</em>.
     """
     messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
     messages = _trim_messages(messages)
@@ -1501,16 +1521,129 @@ async def health_check():
     return {"status": "ok", "message": "Backend is running!"}
 
 
+def _guide_settings_model_list(key: str) -> str:
+    """HTML fragment listing model ids from ``settings.json`` (for /api/documentation)."""
+    raw = _backend_settings.get(key)
+    if not isinstance(raw, list) or not raw:
+        return "<em>(not set in settings.json)</em>"
+    parts: List[str] = []
+    for x in raw:
+        if isinstance(x, str) and x.strip():
+            parts.append(f"<code>{html.escape(x.strip())}</code>")
+    return ", ".join(parts) if parts else "<em>(not set in settings.json)</em>"
+
+
 def _api_usage_guide_html() -> str:
-    """Static HTML overview of endpoints and parameters (complements OpenAPI schemas below)."""
-    return """
+    """HTML overview of endpoints; includes settings-driven model lists (complements OpenAPI)."""
+    default_chat = html.escape(DEFAULT_CHAT_MODEL, quote=False)
+    local_models = _guide_settings_model_list("local_models")
+    cloud_models = _guide_settings_model_list("cloud_models")
+    thinking_models = _guide_settings_model_list("thinking_models")
+    reasoning_models = _guide_settings_model_list("reasoning_models")
+    default_model_note = (
+        f"<code>{default_chat}</code> — set explicitly as <code>default_chat_model</code> in settings.json."
+        if "default_chat_model" in _backend_settings
+        else f"<code>{default_chat}</code> — resolved from first <code>local_models</code> entry, or built-in fallback."
+    )
+    return f"""
   <section class="guide" id="api-usage-guide" aria-label="How to use this API">
     <h2>How to use this API</h2>
     <p class="muted">
       Use <code>Content-Type: application/json</code> for JSON bodies. Default base URL when developing is
       <code>http://localhost:8000</code>. Interactive docs: <a href="/docs">/docs</a> (Swagger),
       <a href="/redoc">/redoc</a> (ReDoc).
+      Outgoing responses with <code>Content-Type: application/json</code> (non-streaming) are checked; invalid JSON is
+      repaired when possible (e.g. trailing commas, markdown <code>```json</code> fences, bad escapes in strings) before the client receives the body.
     </p>
+
+    <h3>Configured model ids (settings.json)</h3>
+    <p class="muted">
+      These lists are <strong>documentation hints</strong> only (the server does not preload Ollama weights on startup).
+      Install and load models via <code>GET /api/models</code>, <code>POST /api/models/load</code>, and the UI.
+    </p>
+    <table class="guide">
+      <thead><tr><th>Key</th><th>Purpose</th><th>Current values</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>default_chat_model</code></td>
+          <td>Optional explicit default when <code>model</code> is omitted on <code>POST /api/chat</code>.</td>
+          <td>{default_model_note}</td>
+        </tr>
+        <tr><td><code>local_models</code></td><td>Suggested Ollama chat model ids for your app / UI.</td><td>{local_models}</td></tr>
+        <tr><td><code>cloud_models</code></td><td>Suggested OpenAI (or other cloud) model ids.</td><td>{cloud_models}</td></tr>
+        <tr><td><code>thinking_models</code></td><td>Ids where you typically enable <code>thinking</code> (Ollama).</td><td>{thinking_models}</td></tr>
+        <tr><td><code>reasoning_models</code></td><td>Ids where you typically set <code>reasoning</code> (OpenAI).</td><td>{reasoning_models}</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Installed vs loaded Ollama models</h3>
+    <ul class="muted">
+      <li><code>GET /api/models</code> — models available on disk (<code>ollama ls</code>).</li>
+      <li><code>GET /api/models/loaded</code> — runners currently in VRAM (<code>ollama ps</code>).</li>
+      <li>Only the resolved default id (<code>{default_chat}</code> right now) may be used for chat without a prior load;
+          any other Ollama id must already be loaded or the API returns <code>400</code>.</li>
+    </ul>
+
+    <h3>Structured output &amp; tools</h3>
+    <p class="muted">
+      When <code>structured_output</code> is true, <code>stream</code> must be <code>false</code>. The server uses
+      <strong>LangChain</strong> <code>with_structured_output</code> (forced tool / function calling) for
+      <strong>Ollama</strong> and <strong>OpenAI</strong>; <strong>Anthropic</strong> uses native tool_use over HTTP.
+    </p>
+    <table class="guide">
+      <thead><tr><th>Tool</th><th>Where</th><th>Response shape</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>deliver_chat_response</code> (default)</td>
+          <td>Ollama, OpenAI, Anthropic when <code>structured_output</code> is set and <code>structured_tool</code> is omitted.</td>
+          <td>
+            JSON <code>structured.segments</code>: array of segment objects with
+            <code>kind</code> (<code>markdown</code> | <code>math_inline</code> | <code>math_display</code>) and string <code>body</code>.
+            Assistant <code>message.content</code> is the same reply rendered as markdown + <code>$...$</code> / <code>$$...$$</code>.
+          </td>
+        </tr>
+        <tr>
+          <td>Custom tool (<code>structured_tool</code>)</td>
+          <td><strong>Local Ollama only</strong> (not cloud).</td>
+          <td>
+            Body field <code>structured_tool</code>: <code>name</code>, optional <code>description</code>, and OpenAI-style
+            <code>parameters</code> JSON Schema. Response: <code>structured.tool_name</code> and <code>structured.arguments</code> (object).
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <ul class="muted">
+      <li>LaTeX belongs in segment <code>body</code> strings with valid JSON escaping (<code>\\\\frac</code> not a raw tab).</li>
+      <li>Smoke-test Ollama tool + JSON: <code>GET /api/ollama/verify-tools-json?model=...</code> (model must be loaded).</li>
+    </ul>
+
+    <h3>Thinking (Ollama) vs reasoning (OpenAI)</h3>
+    <table class="guide">
+      <thead><tr><th>Field</th><th>When</th><th>Values</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>thinking</code></td>
+          <td><code>POST /api/chat</code> with local Ollama (ignored if cloud).</td>
+          <td>boolean, default <code>true</code></td>
+          <td>
+            <strong>Non-Gemma:</strong> passed to LangChain <code>ChatOllama</code> as Ollama <code>think</code> / <code>reasoning</code> on each call.<br/>
+            <strong>Gemma 4:</strong> if <code>true</code>, <code>&lt;|think|&gt;</code> is added to the RAG system message and thought text is stripped from the stream;
+            if <code>structured_output</code> is used, <code>reasoning=false</code> is sent to Ollama only when <code>thinking</code> is <code>false</code>.
+          </td>
+        </tr>
+        <tr>
+          <td><code>reasoning</code></td>
+          <td><code>POST /api/chat</code> when routing to OpenAI, or <code>POST /api/cloud/chat</code> with <code>provider: openai</code>.</td>
+          <td><code>null</code> / omit, <code>"none"</code>, <code>"low"</code>, <code>"medium"</code>, <code>"high"</code>, <code>"xhigh"</code></td>
+          <td>
+            Mapped to LangChain <code>ChatOpenAI.reasoning_effort</code>. <code>null</code> or <code>"none"</code> → parameter omitted.
+            With <code>structured_output</code>, OpenAI requires the <strong>Responses API</strong> for tool calls + reasoning on models such as <code>gpt-5.4-nano</code>; the server sets LangChain
+            <code>use_responses_api=true</code> and <code>output_version=responses/v1</code> when both apply.
+            Other strings are sent as-is for reasoning-capable models; unsupported values surface as upstream errors.
+          </td>
+        </tr>
+      </tbody>
+    </table>
 
     <h3>Chat</h3>
     <table class="guide">
@@ -1520,23 +1653,15 @@ def _api_usage_guide_html() -> str:
           <td><code>POST /api/chat</code></td>
           <td>Main chat: local Ollama or cloud OpenAI/Anthropic (server env keys).</td>
           <td>
-            <strong>model</strong> — Ollama id or cloud model id.<br/>
-            <strong>messages</strong> — <code>[{ "role", "content" }]</code>.<br/>
+            <strong>model</strong> — see configured lists above; discover Ollama with <code>GET /api/models</code>.<br/>
+            <strong>messages</strong> — array of objects with string fields <code>role</code> and <code>content</code> (see OpenAPI).<br/>
             <strong>stream</strong> — <code>true</code> → <code>text/plain</code> stream;
             <code>false</code> → JSON <code>message</code>, <code>model</code>, and if cloud <code>provider</code>.<br/>
             <strong>cloud</strong> — force cloud when model id is ambiguous.<br/>
             <strong>thread_id</strong> — optional; server stores last messages per id (see GET thread).<br/>
             <strong>instruction</strong> — optional; prepended to last user message for this request only.<br/>
-            <strong>structured_output</strong> — optional JSON field; omit or null for false. With
-            <code>stream: false</code>, uses LangChain structured output (local Ollama or cloud OpenAI/Anthropic).
-            Default tool: <code>deliver_chat_response</code> → <code>structured.segments</code>.
-            <strong>structured_tool</strong> — optional (local Ollama only): custom <code>name</code> +
-            JSON Schema <code>parameters</code> → <code>structured.tool_name</code> +
-            <code>structured.arguments</code>.<br/>
-            <strong>thinking</strong> — Ollama: LangChain <code>ChatOllama</code> <code>reasoning</code> (non-Gemma) or Gemma 4
-            <code>&lt;|think|&gt;</code> + strip; structured Gemma uses <code>think=false</code> when <code>false</code>.<br/>
-            <strong>reasoning</strong> — OpenAI cloud: <code>none</code> | <code>low</code> | <code>medium</code> | <code>high</code> | <code>xhigh</code>
-            → LangChain <code>ChatOpenAI.reasoning_effort</code> (<code>none</code> omits the parameter).
+            <strong>structured_output</strong> + <strong>structured_tool</strong> — see <em>Structured output &amp; tools</em>.<br/>
+            <strong>thinking</strong> + <strong>reasoning</strong> — see <em>Thinking vs reasoning</em>.
           </td>
         </tr>
         <tr>
@@ -1545,11 +1670,11 @@ def _api_usage_guide_html() -> str:
           <td>
             <strong>provider</strong> — <code>openai</code> | <code>anthropic</code> | <code>google</code>.<br/>
             <strong>model</strong>, <strong>messages</strong>, <strong>api_key</strong>.<br/>
-            <strong>reasoning</strong> — optional; OpenAI only (same as <code>/api/chat</code>).
+            <strong>reasoning</strong> — optional; OpenAI only (same semantics as <code>/api/chat</code>).
           </td>
         </tr>
         <tr>
-          <td><code>GET /api/chat/threads/{thread_id}</code></td>
+          <td><code>GET /api/chat/threads/{{thread_id}}</code></td>
           <td>Return stored messages for a thread (if any).</td>
           <td>Path: <strong>thread_id</strong> — same as sent in <code>POST /api/chat</code>.</td>
         </tr>
@@ -1563,7 +1688,7 @@ def _api_usage_guide_html() -> str:
         <tr>
           <td><code>POST /api/rag/documents</code></td>
           <td>Add plain texts (chunked + embedded).</td>
-          <td>Body: <code>{ "texts": ["..."] }</code></td>
+          <td>Body: <code>{{ "texts": ["..."] }}</code></td>
         </tr>
         <tr>
           <td><code>POST /api/rag/documents/files</code></td>
@@ -1583,7 +1708,7 @@ def _api_usage_guide_html() -> str:
         <tr>
           <td><code>DELETE /api/rag/chunks</code></td>
           <td>Delete chunks by id.</td>
-          <td>Body: <code>{ "ids": ["..."] }</code></td>
+          <td>Body: <code>{{ "ids": ["..."] }}</code></td>
         </tr>
         <tr>
           <td><code>DELETE /api/rag/storage</code></td>
@@ -1599,8 +1724,9 @@ def _api_usage_guide_html() -> str:
       <tbody>
         <tr><td><code>GET /api/models</code></td><td>List installed Ollama models.</td><td>—</td></tr>
         <tr><td><code>GET /api/models/loaded</code></td><td>Models currently in memory.</td><td>—</td></tr>
-        <tr><td><code>POST /api/models/load</code></td><td>Load a model.</td><td>Body: <code>{ "model": "..." }</code></td></tr>
-        <tr><td><code>POST /api/models/stop</code></td><td>Stop a model.</td><td>Body: <code>{ "model": "..." }</code></td></tr>
+        <tr><td><code>POST /api/models/load</code></td><td>Load a model.</td><td>Body: <code>{{ "model": "..." }}</code></td></tr>
+        <tr><td><code>POST /api/models/stop</code></td><td>Stop a model.</td><td>Body: <code>{{ "model": "..." }}</code></td></tr>
+        <tr><td><code>GET /api/ollama/verify-tools-json</code></td><td>Run LangChain tool + JSON checks on a <strong>loaded</strong> Ollama model.</td><td>Query <code>model</code> (optional; defaults to resolved default id).</td></tr>
         <tr><td><code>GET /api/sysinfo</code></td><td>Host memory stats.</td><td>—</td></tr>
         <tr><td><code>GET /api/health</code></td><td>Liveness.</td><td>—</td></tr>
       </tbody>
@@ -2086,7 +2212,15 @@ async def load_model(request: LoadModelRequest):
         raise HTTPException(status_code=500, detail=str(e2))
 
 
-@app.get("/api/ollama/verify-tools-json")
+@app.get(
+    "/api/ollama/verify-tools-json",
+    summary="Verify Ollama tool calling and JSON (LangChain)",
+    description=(
+        "Runs scripted checks (Multiply tool + JSON-schema LaTeX payload) against a **loaded** Ollama model. "
+        "Optional query `model` defaults to the server’s resolved default chat id (settings.json). "
+        "See /api/documentation → Structured output & tools."
+    ),
+)
 async def ollama_verify_tools_json(model: Optional[str] = None):
     """Run ChatOllama tool-calling and JSON-schema (LaTeX string) checks against a loaded Ollama model."""
     from ollama_tools_json_verify import run_ollama_tools_json_verification

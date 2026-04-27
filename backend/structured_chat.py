@@ -15,7 +15,9 @@ dedicated JSON string values with normal JSON escaping.
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
@@ -70,6 +72,144 @@ STRUCTURED_TOOL_SYSTEM_ADDENDUM = (
     "In JSON string values, every backslash must be doubled (e.g. `\\\\frac` for \\frac). "
     "A single `\\t` inside a string is a TAB character — so write `\\\\times` for \\times, not `\\times`."
 )
+
+
+def _repair_invalid_json_escape_sequences(s: str) -> str:
+    """
+    Fix common LLM mistake: LaTeX ``\\times`` written as ``\\t`` + ``imes`` in JSON strings.
+
+    Inside double-quoted JSON strings only: if ``\\`` is not followed by a valid JSON
+    escape introducer, emit an extra ``\\`` so the following character is literal.
+    """
+    out: List[str] = []
+    i = 0
+    n = len(s)
+    in_str = False
+
+    def _backslashes_before(pos: int) -> int:
+        c = 0
+        p = pos - 1
+        while p >= 0 and s[p] == "\\":
+            c += 1
+            p -= 1
+        return c
+
+    while i < n:
+        ch = s[i]
+        if not in_str:
+            out.append(ch)
+            if ch == '"' and _backslashes_before(i) % 2 == 0:
+                in_str = True
+            i += 1
+            continue
+
+        if ch == '"' and _backslashes_before(i) % 2 == 0:
+            in_str = False
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "t" and i + 2 < n and s[i + 2].isalpha():
+                out.append("\\")
+                out.append("\\")
+                i += 1
+                continue
+            if nxt in ('"', "\\", "/", "b", "f", "n", "r", "t"):
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            if nxt == "u" and i + 5 < n:
+                hex4 = s[i + 2 : i + 6]
+                if len(hex4) == 4 and re.fullmatch(r"[0-9a-fA-F]{4}", hex4):
+                    out.append(s[i : i + 6])
+                    i += 6
+                    continue
+            out.append("\\")
+            out.append("\\")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _looks_like_non_json_object_brace(t: str) -> bool:
+    """True when ``t`` starts like ``{foo`` (not ``{"key"``) — common LaTeX / typo, not JSON."""
+    if not t.startswith("{"):
+        return False
+    i = 1
+    n = len(t)
+    while i < n and t[i].isspace():
+        i += 1
+    return i >= n or t[i] != '"'
+
+
+def _latex_blob_tool_string_heuristic(s: str) -> bool:
+    """Heuristic: string is probably math/LaTeX leaked into tool args instead of JSON."""
+    t = s.strip()
+    if _looks_like_non_json_object_brace(t):
+        return True
+    if re.search(r"\\end\s*\{\s*cases\s*\}|\\begin\s*\{\s*cases\s*\}|\{\s*cases\s*\}", t):
+        return True
+    return False
+
+
+def _recover_cases_shorthand(body: str) -> str:
+    """Turn ``{cases} ... \\end{cases}`` (missing ``\\begin``) into valid amsmath cases body."""
+    t = body.strip()
+    m = re.match(r"^\{\s*cases\s*\}", t, re.IGNORECASE)
+    if m:
+        t = "\\begin{cases}" + t[m.end() :]
+    return t
+
+
+def _fallback_segments_payload_from_latex_blob(s: str) -> dict:
+    """Last resort for ``deliver_chat_response`` when the model emits TeX, not JSON."""
+    body = _recover_cases_shorthand(s.strip())
+    return {"segments": [{"kind": "math_display", "body": body}]}
+
+
+def coerce_tool_arguments(raw: object, *, latex_blob_fallback: bool = False) -> dict:
+    """Normalize LangChain / API tool ``arguments`` to a dict (robust to bad JSON escapes).
+
+    When ``latex_blob_fallback`` is True (default ``deliver_chat_response`` tool only), a string
+    that is still not JSON but looks like LaTeX (e.g. ``{cases} ... \\end{cases}``) is wrapped as
+    a single ``math_display`` segment so the reply can render instead of failing JSON parse.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    if not isinstance(raw, str):
+        raise TypeError(f"tool arguments must be object or JSON string, got {type(raw).__name__}")
+    s = raw.strip()
+    if not s:
+        return {}
+    fixed = _repair_invalid_json_escape_sequences(s)
+    try:
+        out = json.loads(fixed)
+    except json.JSONDecodeError:
+        try:
+            out = ast.literal_eval(s)
+        except (SyntaxError, ValueError):
+            try:
+                out = ast.literal_eval(fixed)
+            except (SyntaxError, ValueError) as e:
+                if latex_blob_fallback and _latex_blob_tool_string_heuristic(s):
+                    return _fallback_segments_payload_from_latex_blob(s)
+                raise ValueError(f"tool arguments are not valid JSON after escape repair: {e}") from e
+    if not isinstance(out, dict):
+        raise ValueError("tool arguments JSON must decode to an object")
+    return out
+
+
+def coerce_default_deliver_tool_arguments(raw: object) -> dict:
+    """Like :func:`coerce_tool_arguments` with ``latex_blob_fallback=True`` for ``deliver_chat_response``."""
+    return coerce_tool_arguments(raw, latex_blob_fallback=True)
 
 
 def _dict_messages_to_langchain(messages: List[dict]) -> list:
@@ -185,7 +325,16 @@ def _payload_from_structured_output_dict(
             f"expected structured tool {tool_name!r}; no parsed payload and no raw message "
             f"(parsing_error={pe!r})"
         )
-    tcalls = getattr(raw, "tool_calls", None) or []
+
+    def _all_tool_call_dicts() -> list:
+        merged: list = []
+        for tc in getattr(raw, "tool_calls", None) or []:
+            merged.append(dict(tc) if not isinstance(tc, dict) else tc)
+        for itc in getattr(raw, "invalid_tool_calls", None) or []:
+            merged.append(dict(itc) if not isinstance(itc, dict) else itc)
+        return merged
+
+    tcalls = _all_tool_call_dicts()
     for tc in tcalls:
         if (tc.get("name") or "").strip() != tool_name:
             continue
@@ -195,7 +344,7 @@ def _payload_from_structured_output_dict(
         if coerce_string_arguments is not None:
             return coerce_string_arguments(ra)
         if isinstance(ra, str):
-            return json.loads(ra)
+            return coerce_tool_arguments(ra, latex_blob_fallback=False)
         raise ValueError(f"tool arguments must be object or string, got {type(ra).__name__}")
     c = getattr(raw, "content", None)
     raise ValueError(f"expected {tool_name!r} tool call; got content={c!r} parsing_error={pe!r}")
@@ -214,6 +363,24 @@ def _extract_anthropic_tool_payload(data: dict) -> dict:
     raise ValueError(f"expected {TOOL_NAME} tool_use block in Anthropic response")
 
 
+def _openai_kwargs_structured_with_optional_reasoning(
+    *,
+    reasoning_effort: Optional[str],
+) -> dict:
+    """OpenAI rejects ``reasoning_effort`` + function tools on ``/v1/chat/completions`` for some models (e.g. gpt-5.4-nano).
+
+    LangChain must use the Responses API (``use_responses_api=True``, ``output_version='responses/v1'``) so tool calls
+    and reasoning share one supported path.
+    """
+    if not reasoning_effort:
+        return {}
+    return {
+        "reasoning_effort": reasoning_effort,
+        "use_responses_api": True,
+        "output_version": "responses/v1",
+    }
+
+
 async def openai_structured_complete(
     model: str,
     messages: List[dict],
@@ -228,7 +395,7 @@ async def openai_structured_complete(
         api_key=api_key,
         timeout=httpx.Timeout(30.0, read=300.0),
         max_retries=2,
-        **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
+        **_openai_kwargs_structured_with_optional_reasoning(reasoning_effort=reasoning_effort),
     )
     structured = llm.with_structured_output(
         _openai_tool_definition(),
@@ -239,7 +406,11 @@ async def openai_structured_complete(
         out = await structured.ainvoke(lc)
     except Exception as e:
         raise RuntimeError(str(e)) from e
-    payload = _payload_from_structured_output_dict(out, tool_name=TOOL_NAME)
+    payload = _payload_from_structured_output_dict(
+        out,
+        tool_name=TOOL_NAME,
+        coerce_string_arguments=coerce_default_deliver_tool_arguments,
+    )
     segments = normalize_segments(payload)
     return segments_to_markdown(segments), segments
 
@@ -294,3 +465,55 @@ async def anthropic_structured_complete(
     tool_payload = _extract_anthropic_tool_payload(data)
     segments = normalize_segments(tool_payload)
     return segments_to_markdown(segments), segments
+
+
+def _patch_langchain_core_parse_tool_call() -> None:
+    """When OpenAI-format ``function.arguments`` is not valid JSON, apply Pluto coercion (same as Ollama patch)."""
+    from langchain_core.exceptions import OutputParserException
+    from langchain_core.messages.tool import tool_call as create_tool_call
+    from langchain_core.output_parsers import openai_tools as ot
+
+    if getattr(ot, "_pluto_parse_tool_call_patched", False):
+        return
+
+    _orig = ot.parse_tool_call
+
+    def parse_tool_call(
+        raw_tool_call: dict[str, Any],
+        *,
+        partial: bool = False,
+        strict: bool = False,
+        return_id: bool = True,
+    ) -> Any:
+        try:
+            return _orig(
+                raw_tool_call,
+                partial=partial,
+                strict=strict,
+                return_id=return_id,
+            )
+        except OutputParserException:
+            if partial:
+                raise
+            fn = str((raw_tool_call.get("function") or {}).get("name") or "").strip()
+            argstr = (raw_tool_call.get("function") or {}).get("arguments")
+            if not isinstance(argstr, str):
+                raise
+            if fn == TOOL_NAME:
+                coerced = coerce_default_deliver_tool_arguments(argstr)
+            else:
+                coerced = coerce_tool_arguments(argstr, latex_blob_fallback=False)
+            parsed: dict[str, Any] = {
+                "name": raw_tool_call["function"]["name"] or "",
+                "args": coerced or {},
+            }
+            if return_id:
+                parsed["id"] = raw_tool_call.get("id")
+                return create_tool_call(**parsed)
+            return parsed
+
+    ot.parse_tool_call = parse_tool_call
+    ot._pluto_parse_tool_call_patched = True
+
+
+_patch_langchain_core_parse_tool_call()

@@ -7,19 +7,24 @@ Ollama local structured output via LangChain ``ChatOllama.with_structured_output
 - Ollama tool wire format: https://docs.ollama.com/capabilities/tool-calling
 
 Uses ``method="function_calling"`` (forced tool). When LangChain's parser fails on tool
-arguments, falls back to ``_coerce_arguments`` (JSON escape repair for LaTeX, etc.).
+arguments, falls back to ``coerce_tool_arguments`` (JSON escape repair for LaTeX, etc.).
+
+**LangChain quirk:** ``langchain_ollama`` parses tool-call argument strings with strict
+``json.loads`` while building the assistant message. Malformed JSON never reaches our
+coercers unless we patch ``_parse_arguments_from_tool_call`` (see
+``_patch_langchain_ollama_tool_argument_parsing``).
 """
 
 from __future__ import annotations
 
-import ast
 import json
 import logging
-import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from langchain_core.exceptions import OutputParserException
 from langchain_ollama import ChatOllama
+import langchain_ollama.chat_models as _lc_ollama_chat
 
 _log = logging.getLogger("uvicorn.error")
 
@@ -28,10 +33,46 @@ from structured_chat import (
     TOOL_NAME,
     _dict_messages_to_langchain,
     _payload_from_structured_output_dict,
+    coerce_default_deliver_tool_arguments,
+    coerce_tool_arguments,
     inject_structured_system_instruction,
     normalize_segments,
     segments_to_markdown,
 )
+
+
+def _patch_langchain_ollama_tool_argument_parsing() -> None:
+    """Let invalid tool JSON reach :func:`coerce_tool_arguments` instead of failing in LangChain."""
+    if getattr(_lc_ollama_chat, "_pluto_tool_arg_parse_patched", False):
+        return
+
+    _orig = _lc_ollama_chat._parse_arguments_from_tool_call
+
+    def _parse_arguments_from_tool_call(raw_tool_call: dict[str, Any]) -> Optional[dict[str, Any]]:
+        try:
+            return _orig(raw_tool_call)
+        except OutputParserException:
+            fn = str((raw_tool_call.get("function") or {}).get("name") or "").strip()
+            arguments = (raw_tool_call.get("function") or {}).get("arguments")
+            if not isinstance(arguments, str):
+                raise
+            try:
+                if fn == TOOL_NAME:
+                    return coerce_default_deliver_tool_arguments(arguments)
+                return coerce_tool_arguments(arguments, latex_blob_fallback=False)
+            except (TypeError, ValueError) as e:
+                _log.warning(
+                    "Ollama tool args still invalid after Pluto coercion (tool=%r): %s",
+                    fn or "?",
+                    e,
+                )
+                raise
+
+    _lc_ollama_chat._parse_arguments_from_tool_call = _parse_arguments_from_tool_call
+    _lc_ollama_chat._pluto_tool_arg_parse_patched = True
+
+
+_patch_langchain_ollama_tool_argument_parsing()
 
 
 def _is_gemma4_model(model: str) -> bool:
@@ -77,103 +118,6 @@ def _inject_custom_tool_instruction(messages: List[dict], tool_name: str, tool_d
             out.append(dict(m))
     if not injected:
         out.insert(0, {"role": "system", "content": addendum.strip()})
-    return out
-
-
-def _repair_invalid_json_escape_sequences(s: str) -> str:
-    """
-    Fix common LLM mistake: LaTeX ``\\times`` written as ``\\times`` in prose but in JSON
-    appears as ``\\t`` + ``imes`` which JSON parses as TAB + ``imes`` (invalid).
-
-    Inside double-quoted JSON strings only: if ``\\`` is not followed by a valid JSON
-    escape introducer, emit an extra ``\\`` so the following character is literal.
-    """
-    out: List[str] = []
-    i = 0
-    n = len(s)
-    in_str = False
-
-    def _backslashes_before(pos: int) -> int:
-        c = 0
-        p = pos - 1
-        while p >= 0 and s[p] == "\\":
-            c += 1
-            p -= 1
-        return c
-
-    while i < n:
-        ch = s[i]
-        if not in_str:
-            out.append(ch)
-            if ch == '"' and _backslashes_before(i) % 2 == 0:
-                in_str = True
-            i += 1
-            continue
-
-        # Inside JSON string
-        if ch == '"' and _backslashes_before(i) % 2 == 0:
-            in_str = False
-            out.append(ch)
-            i += 1
-            continue
-
-        if ch == "\\" and i + 1 < n:
-            nxt = s[i + 1]
-            # JSON allows ``\\t`` as TAB — but models often write LaTeX ``\\times`` as ``\\t``+``imes``.
-            # If ``t`` is followed by a letter, treat as LaTeX (not a tab) and duplicate the backslash.
-            if nxt == "t" and i + 2 < n and s[i + 2].isalpha():
-                out.append("\\")
-                out.append("\\")
-                i += 1
-                continue
-            if nxt in ('"', "\\", "/", "b", "f", "n", "r", "t"):
-                out.append(ch)
-                out.append(nxt)
-                i += 2
-                continue
-            if nxt == "u" and i + 5 < n:
-                hex4 = s[i + 2 : i + 6]
-                if len(hex4) == 4 and re.fullmatch(r"[0-9a-fA-F]{4}", hex4):
-                    out.append(s[i : i + 6])
-                    i += 6
-                    continue
-            # Invalid JSON escape (e.g. LaTeX \alpha, \times): duplicate backslash
-            out.append("\\")
-            out.append("\\")
-            i += 1
-            continue
-
-        out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _coerce_arguments(raw: object) -> dict:
-    """Normalize Ollama / LangChain tool ``arguments`` to a dict (robust to bad JSON)."""
-    if raw is None:
-        return {}
-    if isinstance(raw, dict):
-        return dict(raw)
-    if not isinstance(raw, str):
-        raise TypeError(f"tool arguments must be object or JSON string, got {type(raw).__name__}")
-    s = raw.strip()
-    if not s:
-        return {}
-    # Always run escape repair before json.loads: valid JSON is unchanged, but ``\\times`` written
-    # as ``\\t``+``imes`` would otherwise decode as TAB without error.
-    fixed = _repair_invalid_json_escape_sequences(s)
-    try:
-        out = json.loads(fixed)
-    except json.JSONDecodeError:
-        try:
-            out = ast.literal_eval(s)
-        except (SyntaxError, ValueError):
-            try:
-                out = ast.literal_eval(fixed)
-            except (SyntaxError, ValueError) as e:
-                raise ValueError(f"tool arguments are not valid JSON after escape repair: {e}") from e
-    if not isinstance(out, dict):
-        raise ValueError("tool arguments JSON must decode to an object")
     return out
 
 
@@ -251,7 +195,11 @@ async def ollama_structured_chat_complete(
         args = _payload_from_structured_output_dict(
             out,
             tool_name=default_tool_name,
-            coerce_string_arguments=_coerce_arguments,
+            coerce_string_arguments=(
+                coerce_default_deliver_tool_arguments
+                if not custom_tool
+                else coerce_tool_arguments
+            ),
         )
     except (TypeError, ValueError, json.JSONDecodeError) as e:
         snippet = ""
