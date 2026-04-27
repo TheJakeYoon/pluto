@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import List, Optional
+from urllib.parse import unquote, urlparse
 
+import httpx
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl
 
 from . import metrics
 from .config import (
@@ -24,6 +27,57 @@ from .education_agent import get_education_agent
 from .insertion_agent import get_insertion_agent
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+_URL_INSERT_MAX_BYTES = 30 * 1024 * 1024
+_URL_INSERT_TIMEOUT = httpx.Timeout(20.0, read=60.0)
+_URL_EXT_BY_CONTENT_TYPE = {
+    "application/pdf": ".pdf",
+    "text/html": ".html",
+    "application/xhtml+xml": ".html",
+}
+
+
+def _filename_from_url(url: str, content_type: str) -> str:
+    parsed = urlparse(url)
+    host = re.sub(r"[^A-Za-z0-9._-]+", "-", parsed.netloc).strip("-") or "web"
+    path_name = os.path.basename(unquote(parsed.path or "")).strip()
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", path_name).strip("-")
+    ext = os.path.splitext(safe_name)[1].lower()
+    base = os.path.splitext(safe_name)[0].strip("-") or "document"
+    if ext not in (".pdf", ".html", ".htm"):
+        ctype = (content_type or "").split(";", 1)[0].strip().lower()
+        ext = _URL_EXT_BY_CONTENT_TYPE.get(ctype, ".html")
+    return f"{host}-{base}{ext}"
+
+
+async def _download_insertable_url(url: str) -> tuple[str, bytes, str]:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        try:
+            async with client.stream("GET", url, timeout=_URL_INSERT_TIMEOUT) as response:
+                if response.status_code >= 400:
+                    raise HTTPException(status_code=400, detail=f"URL returned HTTP {response.status_code}: {url}")
+                ctype = (response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+                parsed_ext = os.path.splitext(urlparse(str(response.url)).path)[1].lower()
+                if ctype not in _URL_EXT_BY_CONTENT_TYPE and parsed_ext not in (".pdf", ".html", ".htm"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"URL must point to a PDF or HTML page (got content-type {ctype or 'unknown'}).",
+                    )
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > _URL_INSERT_MAX_BYTES:
+                        raise HTTPException(status_code=400, detail="URL download is too large (max 30 MB).")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                if not data:
+                    raise HTTPException(status_code=400, detail=f"URL returned an empty body: {url}")
+                return _filename_from_url(str(response.url), ctype), data, str(response.url)
+        except HTTPException:
+            raise
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"Could not fetch URL {url}: {e}") from e
 
 
 # ---------- config ----------
@@ -91,6 +145,40 @@ async def insertion_upload(files: List[UploadFile] = File(...)):
                 "rejected": rejected,
             },
         )
+
+    return {
+        "status": "ok",
+        "processed": len(results),
+        "rejected": rejected,
+        "results": results,
+    }
+
+
+class InsertionUrlRequest(BaseModel):
+    urls: List[HttpUrl] = Field(..., min_length=1, max_length=10)
+
+
+@router.post("/insertion/url")
+async def insertion_url(req: InsertionUrlRequest):
+    """Insert PDF or HTML web links into the knowledge base."""
+    agent = get_insertion_agent()
+    results: List[dict] = []
+    rejected: List[str] = []
+
+    for raw_url in req.urls:
+        url = str(raw_url)
+        try:
+            filename, data, final_url = await _download_insertable_url(url)
+            path = agent.persist_upload(filename, data)
+            result = await asyncio.to_thread(agent.ingest_file, path, source_url=final_url)
+            results.append(result)
+        except HTTPException as e:
+            rejected.append(f"{url} — {e.detail}")
+        except Exception as e:
+            rejected.append(f"{url} — {e}")
+
+    if not results and rejected:
+        raise HTTPException(status_code=400, detail={"message": "No URLs could be inserted.", "rejected": rejected})
 
     return {
         "status": "ok",

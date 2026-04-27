@@ -5,6 +5,21 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import {
+  Button,
+  Checkbox,
+  FormControl,
+  FormControlLabel,
+  IconButton,
+  InputLabel,
+  MenuItem,
+  Select,
+  Stack,
+  Tab,
+  Tabs,
+  TextField,
+  Tooltip,
+} from '@mui/material';
 
 /**
  * LLMs often emit LaTeX without proper $ / $$ delimiters. Normalize before remark-math.
@@ -34,6 +49,101 @@ function preprocessMathForMarkdown(text) {
     return match;
   });
   return t;
+}
+
+const markdownComponents = {
+  p: ({ children }) => (
+    <p style={{ margin: '0.3rem 0' }}>
+      {children}
+    </p>
+  ),
+  ul: ({ children }) => (
+    <ul style={{ paddingLeft: '1.25rem', margin: '0.25rem 0' }}>
+      {children}
+    </ul>
+  ),
+  ol: ({ children }) => (
+    <ol style={{ paddingLeft: '1.25rem', margin: '0.25rem 0' }}>
+      {children}
+    </ol>
+  ),
+  li: ({ children }) => (
+    <li style={{ marginBottom: '0.15rem' }}>
+      {children}
+    </li>
+  ),
+  strong: ({ children }) => (
+    <strong style={{ fontWeight: 600 }}>
+      {children}
+    </strong>
+  ),
+};
+
+function splitThinkingSections(content) {
+  const text = typeof content === 'string' ? content : '';
+  const thoughtMatch = /(^|\n)\s*(Thinking|Reasoning):\s*\n?/i.exec(text);
+  if (!thoughtMatch) return [{ type: 'answer', text }];
+
+  const thoughtLabelStart = thoughtMatch.index + thoughtMatch[1].length;
+  const thoughtContentStart = thoughtMatch.index + thoughtMatch[0].length;
+  const answerRe = /(^|\n)\s*Answer:\s*\n?/i;
+  answerRe.lastIndex = thoughtContentStart;
+  const answerMatch = answerRe.exec(text.slice(thoughtContentStart));
+  if (!answerMatch) {
+    return [
+      { type: 'answer', text: text.slice(0, thoughtLabelStart) },
+      { type: 'thinking', label: thoughtMatch[2], text: text.slice(thoughtContentStart) },
+    ].filter((part) => part.text);
+  }
+
+  const answerLabelStart = thoughtContentStart + answerMatch.index + answerMatch[1].length;
+  const answerContentStart = thoughtContentStart + answerMatch.index + answerMatch[0].length;
+  return [
+    { type: 'answer', text: text.slice(0, thoughtLabelStart) },
+    { type: 'thinking', label: thoughtMatch[2], text: text.slice(thoughtContentStart, answerLabelStart) },
+    { type: 'answer', text: text.slice(answerContentStart) },
+  ].filter((part) => part.text);
+}
+
+function MarkdownText({ text }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
+      components={markdownComponents}
+    >
+      {preprocessMathForMarkdown(text)}
+    </ReactMarkdown>
+  );
+}
+
+function MessageContent({ content }) {
+  return (
+    <>
+      {splitThinkingSections(content).map((part, idx) => {
+        if (part.type !== 'thinking') {
+          return <MarkdownText key={idx} text={part.text} />;
+        }
+        return (
+          <div
+            key={idx}
+            style={{
+              color: 'var(--text-secondary)',
+              opacity: 0.72,
+              borderLeft: '2px solid rgba(148, 163, 184, 0.35)',
+              paddingLeft: '0.75rem',
+              margin: '0.4rem 0',
+            }}
+          >
+            <div style={{ fontSize: '0.78rem', fontWeight: 600, marginBottom: '0.25rem' }}>
+              {part.label || 'Thinking'}
+            </div>
+            <MarkdownText text={part.text} />
+          </div>
+        );
+      })}
+    </>
+  );
 }
 
 const CLOUD_MODELS = {
@@ -79,6 +189,29 @@ const PROVIDER_LABELS = {
   google: 'Google',
 };
 
+const muiFieldSx = {
+  minWidth: 180,
+  '& .MuiInputBase-root': {
+    color: 'var(--text-primary)',
+    backgroundColor: 'rgba(15, 23, 42, 0.55)',
+    borderRadius: '10px',
+  },
+  '& .MuiInputLabel-root': { color: 'var(--text-secondary)' },
+  '& .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--border)' },
+  '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(96, 165, 250, 0.65)' },
+  '& .MuiSvgIcon-root': { color: 'var(--text-secondary)' },
+};
+
+const muiMenuProps = {
+  PaperProps: {
+    sx: {
+      bgcolor: '#111827',
+      color: 'var(--text-primary)',
+      border: '1px solid var(--border)',
+    },
+  },
+};
+
 const LOCAL_OLLAMA_MODEL_OPTIONS = [
   'gpt-oss:20b',
   'qwen3.5:27b',
@@ -103,8 +236,8 @@ export default function Home() {
   const [models, setModels] = useState([]);
   const [loadedModels, setLoadedModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState('gpt-oss:20b');
-  /** Ollama: LangChain ChatOllama ``reasoning`` (non-Gemma) or Gemma 4 <|think|> + strip from stream. */
-  const [ollamaThinking, setOllamaThinking] = useState(true);
+  /** Ollama: opt-in reasoning. Gemma 4 thought text is hidden, so default off keeps chat visibly streaming. */
+  const [ollamaThinking, setOllamaThinking] = useState(false);
   /** OpenAI reasoning models: maps to LangChain ChatOpenAI reasoning_effort (none = omit). */
   const [openaiReasoning, setOpenaiReasoning] = useState('none');
   const [manageModel, setManageModel] = useState('gpt-oss:20b');
@@ -144,6 +277,7 @@ export default function Home() {
   const [insertResults, setInsertResults] = useState([]);
   const [insertLoading, setInsertLoading] = useState(false);
   const [insertRejected, setInsertRejected] = useState([]);
+  const [insertUrls, setInsertUrls] = useState('');
   const insertFileInputRef = useRef(null);
 
   const [isEduModalOpen, setIsEduModalOpen] = useState(false);
@@ -446,6 +580,9 @@ export default function Home() {
         // Default: incremental plain-text stream (Ollama, cloud via /api/chat, Google /api/cloud/chat)
         setMessages((prev) => [...prev, { role: 'assistant', content: '' }]);
 
+        if (!response.body) {
+          throw new Error('Streaming response body is not available in this browser.');
+        }
         const reader = response.body.getReader();
         const decoder = new TextDecoder('utf-8');
 
@@ -461,6 +598,17 @@ export default function Home() {
             return [
               ...allExceptLast,
               { ...lastMsg, content: lastMsg.content + textChunk },
+            ];
+          });
+        }
+        const trailingText = decoder.decode();
+        if (trailingText) {
+          setMessages((prev) => {
+            const allExceptLast = prev.slice(0, prev.length - 1);
+            const lastMsg = prev[prev.length - 1];
+            return [
+              ...allExceptLast,
+              { ...lastMsg, content: lastMsg.content + trailingText },
             ];
           });
         }
@@ -535,6 +683,51 @@ export default function Home() {
     }
   };
 
+  const handleInsertUrls = async () => {
+    const urls = insertUrls
+      .split(/\s+/)
+      .map((u) => u.trim())
+      .filter(Boolean);
+    if (urls.length === 0) {
+      setInsertProgress('Enter at least one web link.');
+      return;
+    }
+    setInsertLoading(true);
+    setInsertProgress(`Fetching ${urls.length} link(s)…`);
+    setInsertRejected([]);
+    try {
+      const r = await fetch('http://localhost:8000/api/agents/insertion/url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data?.detail?.message || data?.detail || r.statusText);
+      setInsertResults(data.results || []);
+      setInsertRejected(data.rejected || []);
+      const stored = (data.results || []).reduce((acc, x) => acc + (x.stored_chunks || 0), 0);
+      setInsertProgress(`Inserted ${data.processed || 0} link(s); stored ${stored} chunk(s).`);
+    } catch (err) {
+      setInsertProgress(`Error: ${err.message || err}`);
+    } finally {
+      setInsertLoading(false);
+    }
+  };
+
+  const openInsertedDataView = () => {
+    setSettingsTab('embeddings');
+    setIsManageModalOpen(true);
+    setEmbeddingsError(null);
+    setChunksLoading(true);
+    fetch('http://localhost:8000/api/rag/chunks?limit=500&offset=0')
+      .then(r => {
+        if (!r.ok) return r.json().then(data => { setEmbeddingsError(data.detail || r.statusText); setEmbeddingsChunks([]); });
+        return r.json().then(data => { setEmbeddingsChunks(data.chunks || []); setEmbeddingsError(null); });
+      })
+      .catch(() => { setEmbeddingsChunks([]); setEmbeddingsError('Failed to load chunks'); })
+      .finally(() => setChunksLoading(false));
+  };
+
   const handleEducationGenerate = async () => {
     if (!eduTopic.trim()) {
       setEduError('Please enter a topic.');
@@ -594,153 +787,176 @@ export default function Home() {
         <header className="header" style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', position: 'relative' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div className="header-title" style={{ flex: 1, textAlign: 'center' }}>
-              <span>✨</span> Ollama Chat
+              <span>♇</span> Pluto
             </div>
 
             <div style={{ position: 'absolute', top: '10px', right: '15px', display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
-              <button
-                onClick={() => { setIsInsertModalOpen(true); setInsertProgress(null); setInsertResults([]); setInsertRejected([]); }}
-                style={{
-                  background: 'var(--accent-color, #2563eb)', color: 'white', border: 'none',
-                  padding: '0.35rem 0.75rem', borderRadius: '6px', cursor: 'pointer',
-                  fontSize: '0.8rem', fontWeight: 600,
-                }}
+              <Button
+                onClick={() => { setIsInsertModalOpen(true); setInsertProgress(null); setInsertResults([]); setInsertRejected([]); setInsertUrls(''); }}
+                variant="contained"
+                size="small"
+                sx={{ textTransform: 'none', borderRadius: '10px', fontWeight: 700 }}
                 title="Insert documents into the knowledge base"
               >
                 Insert
-              </button>
-              <button
+              </Button>
+              <Button
                 onClick={() => { setIsEduModalOpen(true); setEduResult(null); setEduError(null); }}
-                style={{
-                  background: '#10b981', color: 'white', border: 'none',
-                  padding: '0.35rem 0.75rem', borderRadius: '6px', cursor: 'pointer',
-                  fontSize: '0.8rem', fontWeight: 600,
-                }}
+                variant="contained"
+                color="success"
+                size="small"
+                sx={{ textTransform: 'none', borderRadius: '10px', fontWeight: 700 }}
                 title="Generate educational content"
               >
                 Generate
-              </button>
-              <button
-                onClick={() => setIsManageModalOpen(true)}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}
-                title="Settings"
+              </Button>
+              <Button
+                onClick={openInsertedDataView}
+                variant="outlined"
+                size="small"
+                sx={{
+                  textTransform: 'none',
+                  borderRadius: '10px',
+                  fontWeight: 700,
+                  color: 'var(--text-primary)',
+                  borderColor: 'var(--border)',
+                }}
+                title="View inserted chunks"
               >
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="3"></circle>
-                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                </svg>
-              </button>
+                View
+              </Button>
+              <Tooltip title="Settings">
+                <IconButton
+                  onClick={() => setIsManageModalOpen(true)}
+                  size="small"
+                  sx={{ color: 'var(--text-secondary)' }}
+                >
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                  </svg>
+                </IconButton>
+              </Tooltip>
             </div>
           </div>
 
           {/* Provider Tabs */}
           <div style={{ display: 'flex', justifyContent: 'center', marginTop: '0.2rem' }}>
-            <div className="provider-tabs">
+            <Tabs
+              value={provider}
+              onChange={(_, key) => {
+                setProvider(key);
+                if (key === 'ollama') refreshOllamaModelState();
+              }}
+              variant="scrollable"
+              sx={{
+                minHeight: 36,
+                '& .MuiTab-root': {
+                  color: 'var(--text-secondary)',
+                  minHeight: 36,
+                  textTransform: 'none',
+                  fontWeight: 700,
+                },
+                '& .Mui-selected': { color: 'var(--text-primary)' },
+                '& .MuiTabs-indicator': { backgroundColor: 'var(--accent-color, #60a5fa)' },
+              }}
+            >
               {Object.entries(PROVIDER_LABELS).map(([key, label]) => (
-                <button
-                  key={key}
-                  onClick={() => {
-                    setProvider(key);
-                    if (key === 'ollama') refreshOllamaModelState();
-                  }}
-                  className={`provider-tab ${provider === key ? 'active' : ''}`}
-                >
-                  {label}
-                </button>
+                <Tab key={key} value={key} label={label} />
               ))}
-            </div>
+            </Tabs>
           </div>
 
           {/* Model Selector */}
           <div style={{ display: 'flex', justifyContent: 'center' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'var(--bg-secondary)', padding: '0.3rem 0.6rem', borderRadius: '8px', border: '1px solid var(--border)' }}>
-              <button
+            <Stack
+              direction="row"
+              spacing={1}
+              alignItems="center"
+              sx={{ background: 'var(--bg-secondary)', p: 0.75, borderRadius: '12px', border: '1px solid var(--border)' }}
+            >
+              <Button
                 type="button"
                 onClick={() => { setMessages([]); setThreadId(typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `thread-${Date.now()}`); setError(null); }}
-                className="model-badge"
-                style={{ cursor: 'pointer', background: 'transparent', border: 'none', outline: 'none', padding: '0 0.25rem', color: 'var(--text-secondary)', fontSize: '0.85rem' }}
+                variant="text"
+                size="small"
+                sx={{ color: 'var(--text-secondary)', textTransform: 'none', fontWeight: 700 }}
                 title="Start a new conversation (new thread)"
               >
                 New chat
-              </button>
-              <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Model:</span>
+              </Button>
               {provider === 'ollama' ? (
-                <select
-                  value={selectedModel}
-                  onChange={e => setSelectedModel(e.target.value)}
-                  className="model-badge"
-                  style={{ cursor: 'pointer', background: 'transparent', border: 'none', outline: 'none', padding: 0 }}
-                >
-                  {loadedModels.length === 0 && <option value="none">No models loaded</option>}
-                  {loadedModels.map(m => <option key={m} value={m}>{m}</option>)}
-                </select>
+                <FormControl size="small" sx={muiFieldSx}>
+                  <InputLabel id="local-model-label">Model</InputLabel>
+                  <Select
+                    labelId="local-model-label"
+                    label="Model"
+                    value={selectedModel}
+                    onChange={e => setSelectedModel(e.target.value)}
+                    MenuProps={muiMenuProps}
+                  >
+                    {loadedModels.length === 0 && <MenuItem value="none">No models loaded</MenuItem>}
+                    {loadedModels.map(m => <MenuItem key={m} value={m}>{m}</MenuItem>)}
+                  </Select>
+                </FormControl>
               ) : (
-                <select
-                  value={cloudModels[provider]}
-                  onChange={e => setCloudModels(prev => ({ ...prev, [provider]: e.target.value }))}
-                  className="model-badge"
-                  style={{ cursor: 'pointer', background: 'transparent', border: 'none', outline: 'none', padding: 0 }}
-                >
-                  {CLOUD_MODELS[provider].map(m => <option key={m} value={m}>{m}</option>)}
-                </select>
+                <FormControl size="small" sx={muiFieldSx}>
+                  <InputLabel id="cloud-model-label">Model</InputLabel>
+                  <Select
+                    labelId="cloud-model-label"
+                    label="Model"
+                    value={cloudModels[provider]}
+                    onChange={e => setCloudModels(prev => ({ ...prev, [provider]: e.target.value }))}
+                    MenuProps={muiMenuProps}
+                  >
+                    {CLOUD_MODELS[provider].map(m => <MenuItem key={m} value={m}>{m}</MenuItem>)}
+                  </Select>
+                </FormControl>
               )}
               {/* Google requires a browser API key; OpenAI/Anthropic use server .env.local */}
               {provider === 'google' && !apiKeys[provider] && (
                 <span title="API key not set" style={{ color: '#ef4444', fontSize: '0.7rem', cursor: 'help' }}>⚠</span>
               )}
-            </div>
+            </Stack>
           </div>
           {provider === 'ollama' && (
             <div style={{ display: 'flex', justifyContent: 'center', marginTop: '0.35rem' }}>
-              <label
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '0.4rem',
-                  fontSize: '0.78rem',
-                  color: 'var(--text-secondary)',
-                  cursor: 'pointer',
-                  userSelect: 'none',
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={ollamaThinking}
-                  onChange={(e) => setOllamaThinking(e.target.checked)}
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    size="small"
+                    checked={ollamaThinking}
+                    onChange={(e) => setOllamaThinking(e.target.checked)}
+                    sx={{ color: 'var(--text-secondary)' }}
                 />
-                Thinking / reasoning (Ollama + LangChain; Gemma 4 uses hidden {'<|think|>'})
-              </label>
+                }
+                label="Thinking / reasoning (off by default; Gemma 4 hides thought text before streaming the answer)"
+                sx={{
+                  color: 'var(--text-secondary)',
+                  '& .MuiFormControlLabel-label': { fontSize: '0.78rem' },
+                }}
+              />
             </div>
           )}
           {provider === 'openai' && (
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'center',
-                alignItems: 'center',
-                gap: '0.45rem',
-                marginTop: '0.35rem',
-                fontSize: '0.78rem',
-                color: 'var(--text-secondary)',
-              }}
-            >
-              <label htmlFor="openai-reasoning" style={{ userSelect: 'none' }}>
-                Reasoning effort
-              </label>
-              <select
-                id="openai-reasoning"
-                value={openaiReasoning}
-                onChange={(e) => setOpenaiReasoning(e.target.value)}
-                className="model-badge"
-                style={{ cursor: 'pointer', fontSize: '0.78rem' }}
-              >
-                <option value="none">none (default)</option>
-                <option value="low">low</option>
-                <option value="medium">medium</option>
-                <option value="high">high</option>
-                <option value="xhigh">xhigh</option>
-              </select>
-            </div>
+            <Stack direction="row" justifyContent="center" alignItems="center" sx={{ mt: 0.5 }}>
+              <FormControl size="small" sx={{ ...muiFieldSx, minWidth: 160 }}>
+                <InputLabel id="openai-reasoning-label">Reasoning effort</InputLabel>
+                <Select
+                  labelId="openai-reasoning-label"
+                  label="Reasoning effort"
+                  value={openaiReasoning}
+                  onChange={(e) => setOpenaiReasoning(e.target.value)}
+                  MenuProps={muiMenuProps}
+                >
+                  <MenuItem value="none">none (default)</MenuItem>
+                  <MenuItem value="low">low</MenuItem>
+                  <MenuItem value="medium">medium</MenuItem>
+                  <MenuItem value="high">high</MenuItem>
+                  <MenuItem value="xhigh">xhigh</MenuItem>
+                </Select>
+              </FormControl>
+            </Stack>
           )}
         </header>
 
@@ -764,7 +980,7 @@ export default function Home() {
         >
           {messages.length === 0 && (
             <div style={{ textAlign: 'center', color: 'var(--text-secondary)', marginTop: 'auto', marginBottom: 'auto' }}>
-              <h2>Welcome to Ollama Chatbot!</h2>
+              <h2>Welcome to Pluto!</h2>
               <p style={{ marginTop: '0.5rem', opacity: 0.8 }}>
                 {provider === 'ollama'
                   ? 'Type a message below to start chatting.'
@@ -776,39 +992,7 @@ export default function Home() {
           {messages.map((msg, index) => (
             <div key={index} className={`message-wrapper ${msg.role === 'user' ? 'user' : 'bot'}`}>
               <div className="message-bubble">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm, remarkMath]}
-                  rehypePlugins={[[rehypeKatex, { strict: false, throwOnError: false }]]}
-                  components={{
-                    p: ({ children }) => (
-                      <p style={{ margin: '0.3rem 0' }}>
-                        {children}
-                      </p>
-                    ),
-                    ul: ({ children }) => (
-                      <ul style={{ paddingLeft: '1.25rem', margin: '0.25rem 0' }}>
-                        {children}
-                      </ul>
-                    ),
-                    ol: ({ children }) => (
-                      <ol style={{ paddingLeft: '1.25rem', margin: '0.25rem 0' }}>
-                        {children}
-                      </ol>
-                    ),
-                    li: ({ children }) => (
-                      <li style={{ marginBottom: '0.15rem' }}>
-                        {children}
-                      </li>
-                    ),
-                    strong: ({ children }) => (
-                      <strong style={{ fontWeight: 600 }}>
-                        {children}
-                      </strong>
-                    ),
-                  }}
-                >
-                  {preprocessMathForMarkdown(msg.content)}
-                </ReactMarkdown>
+                <MessageContent content={msg.content} />
               </div>
             </div>
           ))}
@@ -833,32 +1017,57 @@ export default function Home() {
         {/* Input Area */}
         <div className="input-area">
           <form onSubmit={handleSend} className="input-container">
-            <textarea
-              className="chat-input"
+            <TextField
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="Send a message..."
-              rows="1"
+              multiline
+              minRows={1}
+              maxRows={8}
               disabled={isLoading}
+              fullWidth
+              variant="outlined"
+              size="small"
+              sx={{
+                '& .MuiInputBase-root': {
+                  color: 'var(--text-primary)',
+                  background: 'var(--input-bg, rgba(15, 23, 42, 0.72))',
+                  borderRadius: '18px',
+                  pr: 0.5,
+                },
+                '& .MuiOutlinedInput-notchedOutline': { borderColor: 'var(--border)' },
+                '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(96, 165, 250, 0.65)' },
+              }}
             />
-            <button
+            <IconButton
               type="submit"
-              className="send-button"
               disabled={!isLoading && !input.trim()}
               aria-label={isLoading ? "Stop response" : "Send Message"}
+              sx={{
+                width: 44,
+                height: 44,
+                ml: 1,
+                color: 'white',
+                backgroundColor: isLoading ? '#ef4444' : 'var(--accent-color, #2563eb)',
+                '&:hover': { backgroundColor: isLoading ? '#dc2626' : '#1d4ed8' },
+                '&.Mui-disabled': {
+                  backgroundColor: 'var(--bg-secondary)',
+                  color: 'var(--text-secondary)',
+                },
+              }}
             >
               {isLoading ? (
-                <svg className="send-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <svg className="send-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                   <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
                 </svg>
               ) : (
-                <svg className="send-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <svg className="send-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
                   <path d="M22 2L11 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                   <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
               )}
-            </button>
+            </IconButton>
           </form>
         </div>
       </main>
@@ -885,38 +1094,29 @@ export default function Home() {
             </div>
 
             {/* Settings Tabs */}
-            <div className="settings-tabs" style={{ marginBottom: '1.5rem' }}>
-              <button
-                onClick={() => setSettingsTab('local')}
-                className={`settings-tab ${settingsTab === 'local' ? 'active' : ''}`}
-              >
-                Local Models
-              </button>
-              <button
-                onClick={() => setSettingsTab('cloud')}
-                className={`settings-tab ${settingsTab === 'cloud' ? 'active' : ''}`}
-              >
-                Cloud API Keys
-              </button>
-              <button
-                onClick={() => setSettingsTab('rag')}
-                className={`settings-tab ${settingsTab === 'rag' ? 'active' : ''}`}
-              >
-                Knowledge base
-              </button>
-              <button
-                onClick={() => setSettingsTab('embeddings')}
-                className={`settings-tab ${settingsTab === 'embeddings' ? 'active' : ''}`}
-              >
-                Embeddings & storage
-              </button>
-              <button
-                onClick={() => setSettingsTab('agents')}
-                className={`settings-tab ${settingsTab === 'agents' ? 'active' : ''}`}
-              >
-                Agents
-              </button>
-            </div>
+            <Tabs
+              value={settingsTab}
+              onChange={(_, value) => setSettingsTab(value)}
+              variant="scrollable"
+              scrollButtons="auto"
+              sx={{
+                mb: 2,
+                '& .MuiTab-root': {
+                  color: 'var(--text-secondary)',
+                  minHeight: 38,
+                  textTransform: 'none',
+                  fontWeight: 700,
+                },
+                '& .Mui-selected': { color: 'var(--text-primary)' },
+                '& .MuiTabs-indicator': { backgroundColor: 'var(--accent-color, #60a5fa)' },
+              }}
+            >
+              <Tab value="local" label="Local Models" />
+              <Tab value="cloud" label="Cloud API Keys" />
+              <Tab value="rag" label="Knowledge base" />
+              <Tab value="embeddings" label="Embeddings & storage" />
+              <Tab value="agents" label="Agents" />
+            </Tabs>
 
             {/* Local Models Tab */}
             {settingsTab === 'local' && (
@@ -1487,7 +1687,7 @@ export default function Home() {
               <button onClick={() => setIsInsertModalOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '1.2rem' }}>✕</button>
             </div>
             <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: 0 }}>
-              The insertion agent stores files in <code>data/uploads</code> and embeds them into ChromaDB using <strong>{agentsConfig?.insertion_agent_model || 'the configured insertion model'}</strong>. Other file types are rejected.
+              The insertion agent stores files and web pages in <code>data/uploads</code> and embeds them into ChromaDB using <strong>{agentsConfig?.insertion_agent_model || 'the configured insertion model'}</strong>. Other file types are rejected.
             </p>
             <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
               Allowed: {allowedInsertExts.join(', ')}
@@ -1509,12 +1709,47 @@ export default function Home() {
               {insertLoading ? 'Uploading…' : 'Choose files…'}
             </button>
 
+            <div style={{ marginTop: '1rem', borderTop: '1px solid var(--border)', paddingTop: '1rem' }}>
+              <label style={{ display: 'block', fontSize: '0.86rem', fontWeight: 600, marginBottom: '0.35rem' }}>
+                Insert web links
+              </label>
+              <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', margin: '0 0 0.5rem 0' }}>
+                Add one URL per line or separated by spaces. PDF files and HTML pages are supported.
+              </p>
+              <textarea
+                className="chat-input"
+                value={insertUrls}
+                onChange={(e) => setInsertUrls(e.target.value)}
+                placeholder="https://example.com/article.html&#10;https://example.com/paper.pdf"
+                rows={3}
+                disabled={insertLoading}
+                style={{ width: '100%', resize: 'vertical' }}
+              />
+              <button
+                type="button"
+                onClick={handleInsertUrls}
+                disabled={insertLoading || !insertUrls.trim()}
+                style={{
+                  marginTop: '0.5rem',
+                  padding: '0.5rem 1rem',
+                  borderRadius: '8px',
+                  fontWeight: 600,
+                  background: insertLoading || !insertUrls.trim() ? 'var(--bg-secondary)' : '#10b981',
+                  color: insertLoading || !insertUrls.trim() ? 'var(--text-secondary)' : 'white',
+                  border: '1px solid var(--border)',
+                  cursor: insertLoading || !insertUrls.trim() ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {insertLoading ? 'Inserting…' : 'Insert links'}
+              </button>
+            </div>
+
             {insertProgress && (
               <div style={{ fontSize: '0.85rem', marginTop: '0.75rem', color: 'var(--text-secondary)' }}>{insertProgress}</div>
             )}
             {insertRejected.length > 0 && (
               <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#fca5a5' }}>
-                Rejected (unsupported types): {insertRejected.join(', ')}
+                Rejected: {insertRejected.join(', ')}
               </div>
             )}
             {insertResults.length > 0 && (
@@ -1522,6 +1757,7 @@ export default function Home() {
                 {insertResults.map((r, i) => (
                   <div key={i} style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '6px', padding: '0.5rem 0.6rem', fontSize: '0.82rem' }}>
                     <div style={{ fontWeight: 600 }}>{r.file}</div>
+                    {r.source_url && <div style={{ color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{r.source_url}</div>}
                     {r.error ? (
                       <div style={{ color: '#fca5a5' }}>Error: {r.error}</div>
                     ) : (
@@ -1552,70 +1788,87 @@ export default function Home() {
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.7rem' }}>
               <div>
-                <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Topic</label>
-                <input
-                  type="text"
+                <TextField
+                  label="Topic"
                   value={eduTopic}
                   onChange={e => setEduTopic(e.target.value)}
                   placeholder="e.g. Introduction to Kalman filters"
-                  className="chat-input"
-                  style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem' }}
+                  fullWidth
+                  size="small"
+                  sx={muiFieldSx}
                 />
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem' }}>
                 <div>
-                  <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Audience</label>
-                  <input
-                    type="text"
+                  <TextField
+                    label="Audience"
                     value={eduAudience}
                     onChange={e => setEduAudience(e.target.value)}
-                    className="chat-input"
-                    style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem' }}
+                    fullWidth
+                    size="small"
+                    sx={muiFieldSx}
                   />
                 </div>
                 <div>
-                  <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Format</label>
-                  <select
-                    value={eduFormat}
-                    onChange={e => setEduFormat(e.target.value)}
-                    className="chat-input"
-                    style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem', cursor: 'pointer' }}
-                  >
-                    <option value="markdown">markdown</option>
-                    <option value="html">html</option>
-                    <option value="json">json</option>
-                    <option value="pdf">pdf</option>
-                  </select>
+                  <FormControl fullWidth size="small" sx={muiFieldSx}>
+                    <InputLabel id="education-format-label">Format</InputLabel>
+                    <Select
+                      labelId="education-format-label"
+                      label="Format"
+                      value={eduFormat}
+                      onChange={e => setEduFormat(e.target.value)}
+                      MenuProps={muiMenuProps}
+                    >
+                      <MenuItem value="markdown">markdown</MenuItem>
+                      <MenuItem value="html">html</MenuItem>
+                      <MenuItem value="json">json</MenuItem>
+                      <MenuItem value="pdf">pdf</MenuItem>
+                    </Select>
+                  </FormControl>
                 </div>
               </div>
               <div>
-                <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Extra instructions (optional)</label>
-                <textarea
+                <TextField
+                  label="Extra instructions (optional)"
                   value={eduExtraInstructions}
                   onChange={e => setEduExtraInstructions(e.target.value)}
-                  rows={2}
-                  className="chat-input"
-                  style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem', resize: 'vertical' }}
+                  minRows={2}
+                  multiline
+                  fullWidth
+                  size="small"
+                  sx={muiFieldSx}
                 />
               </div>
-              <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
-                <input type="checkbox" checked={eduUseWeb} onChange={e => setEduUseWeb(e.target.checked)} />
-                Enable web search (DuckDuckGo)
-              </label>
+              <FormControlLabel
+                control={<Checkbox size="small" checked={eduUseWeb} onChange={e => setEduUseWeb(e.target.checked)} sx={{ color: 'var(--text-secondary)' }} />}
+                label="Enable web search (DuckDuckGo)"
+                sx={{ color: 'var(--text-secondary)', '& .MuiFormControlLabel-label': { fontSize: '0.82rem' } }}
+              />
 
-              <button
-                onClick={handleEducationGenerate}
-                disabled={eduLoading || !eduTopic.trim()}
-                style={{
-                  padding: '0.55rem 1rem', borderRadius: '8px', fontWeight: 600,
-                  background: eduLoading || !eduTopic.trim() ? 'var(--bg-secondary)' : '#10b981',
-                  color: eduLoading || !eduTopic.trim() ? 'var(--text-secondary)' : 'white',
-                  border: '1px solid var(--border)',
-                  cursor: eduLoading || !eduTopic.trim() ? 'not-allowed' : 'pointer',
-                }}
-              >
-                {eduLoading ? 'Generating… (this may take a minute)' : 'Generate'}
-              </button>
+              <Stack direction="row" spacing={1}>
+                <Button
+                  onClick={handleEducationGenerate}
+                  disabled={eduLoading || !eduTopic.trim()}
+                  variant="contained"
+                  color="success"
+                  sx={{ flex: 1, borderRadius: '10px', textTransform: 'none', fontWeight: 700 }}
+                >
+                  {eduLoading ? 'Generating… (this may take a minute)' : 'Generate'}
+                </Button>
+                <Button
+                  onClick={openInsertedDataView}
+                  variant="outlined"
+                  sx={{
+                    borderRadius: '10px',
+                    textTransform: 'none',
+                    fontWeight: 700,
+                    color: 'var(--text-primary)',
+                    borderColor: 'var(--border)',
+                  }}
+                >
+                  View
+                </Button>
+              </Stack>
 
               {eduError && (
                 <div style={{ fontSize: '0.85rem', color: '#fca5a5' }}>Error: {eduError}</div>

@@ -133,7 +133,14 @@ class InsertionAgent:
         return result
 
     # --- agent construction ---
-    def _build_agent(self, file_path: str, extracted_text: str, loader_meta: dict) -> AgentExecutor:
+    def _build_agent(
+        self,
+        file_path: str,
+        extracted_text: str,
+        loader_meta: dict,
+        *,
+        source_url: Optional[str] = None,
+    ) -> AgentExecutor:
         vector_store = self.get_vector_store()
 
         @tool
@@ -163,6 +170,7 @@ class InsertionAgent:
             base_meta = {
                 "source": os.path.basename(file_path),
                 "source_path": file_path,
+                "source_url": source_url or "",
                 "title": (title or "").strip() or os.path.basename(file_path),
                 "summary": (summary or "").strip(),
                 "tags": ",".join([t.strip().lower() for t in (tags or []) if isinstance(t, str) and t.strip()][:8]),
@@ -188,7 +196,7 @@ class InsertionAgent:
         return AgentExecutor(agent=agent, tools=tools, verbose=False, max_iterations=6)
 
     # --- public entrypoint ---
-    def ingest_file(self, file_path: str, *, force_vision: bool = False) -> dict:
+    def ingest_file(self, file_path: str, *, force_vision: bool = False, source_url: Optional[str] = None) -> dict:
         """Run extraction + agent over a single file. Returns a result dict."""
         filename = os.path.basename(file_path)
         with metrics.track_run(
@@ -204,7 +212,7 @@ class InsertionAgent:
                 raise RuntimeError("No text extracted from file.")
 
             excerpt = text[:4000]
-            executor = self._build_agent(file_path, text, load_result.metadata)
+            executor = self._build_agent(file_path, text, load_result.metadata, source_url=source_url)
             try:
                 output = executor.invoke(
                     {
@@ -225,6 +233,7 @@ class InsertionAgent:
                         metadata={
                             "source": filename,
                             "source_path": file_path,
+                            "source_url": source_url or "",
                             "loader": load_result.metadata.get("loader", ""),
                             "fallback": True,
                         },
@@ -244,6 +253,7 @@ class InsertionAgent:
                     "fallback": True,
                     "warnings": load_result.warnings,
                     "run_id": run["id"],
+                    "source_url": source_url,
                 }
 
             # Count what was stored by inspecting steps
@@ -263,6 +273,7 @@ class InsertionAgent:
                 "fallback": False,
                 "warnings": load_result.warnings,
                 "run_id": run["id"],
+                "source_url": source_url,
             }
 
 

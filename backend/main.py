@@ -19,6 +19,10 @@ import httpx
 import json
 import time
 
+import langchain_py314_shim
+
+langchain_py314_shim.install()
+
 # Local Ollama and cloud OpenAI chat use LangChain (ChatOllama / ChatOpenAI) for one stack.
 # Ollama: https://docs.langchain.com/oss/python/integrations/chat/ollama
 # OpenAI: https://docs.langchain.com/oss/python/integrations/chat/openai
@@ -307,23 +311,9 @@ async def add_local_timestamps(request: Request, call_next):
     )
 
     body_cache: Optional[bytes] = None
-    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-        ct = (request.headers.get("content-type") or "").lower()
-        cl_raw = request.headers.get("content-length")
-        skip_body_cache = any(ct.startswith(p) for p in _HTTP_SKIP_BODY_PREFIX)
-        if not skip_body_cache and cl_raw:
-            try:
-                if int(cl_raw) > _HTTP_MAX_PREFETCH:
-                    skip_body_cache = True
-            except ValueError:
-                pass
-        if not skip_body_cache:
-            body_cache = await request.body()
-
-            async def receive():
-                return {"type": "http.request", "body": body_cache, "more_body": False}
-
-            request._receive = receive
+    # Do not read/replay request bodies here. Starlette's BaseHTTPMiddleware can raise
+    # "Unexpected message received: http.request" when a streaming response later
+    # listens for disconnects and sees a replayed request body message.
 
     response = await call_next(request)
     response = apply_json_response_middleware(response)
@@ -428,9 +418,10 @@ class ChatRequest(BaseModel):
         description="If true, use cloud LLM with OPENAI_API_KEY or ANTHROPIC_API_KEY from server env / .env.local.",
     )
     thinking: bool = Field(
-        True,
+        False,
         description=(
-            "Ollama (local) only; ignored for cloud. Maps to LangChain ChatOllama: for non-Gemma models, passed as "
+            "Ollama (local) only; ignored for cloud. Default false so chat visibly streams by default. "
+            "Maps to LangChain ChatOllama: for non-Gemma models, passed as "
             "invoke/stream kwarg reasoning (bool) so Ollama exposes thinking per https://ollama.com/search?c=thinking . "
             "Gemma 4: when true, <|think|> is prepended on the RAG system block and the server strips the thought "
             "channel from streamed/plain text; when structured_output is true, reasoning=false is sent to Ollama only "
@@ -622,6 +613,11 @@ GEMMA4_THINK_TRIGGER = "<|think|>"
 # Gemma 4 model output: reasoning between these markers, then the user-facing answer (see Ollama Gemma 4 readme).
 GEMMA4_THOUGHT_START = "<|channel>thought"
 GEMMA4_THOUGHT_END = "<channel|>"
+STREAMING_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "X-Content-Type-Options": "nosniff",
+}
 
 
 def _is_gemma4_model(model: str) -> bool:
@@ -710,6 +706,11 @@ def _log_ollama_chat_finished(
     _api_timestamp_logger.info("Ollama chat finished: %s", " ".join(parts))
 
 
+def _plain_text_streaming_response(content) -> StreamingResponse:
+    """Plain-text streaming response with headers that prevent browser/proxy buffering."""
+    return StreamingResponse(content, media_type="text/plain", headers=STREAMING_HEADERS)
+
+
 def _strip_gemma4_public_answer(text: str) -> str:
     """Remove Gemma 4 internal thought blocks; keep only content after the closing marker."""
     if not text:
@@ -767,6 +768,90 @@ async def _stream_strip_gemma4_thought(
     if not past and buf:
         _note_first_public()
         yield _strip_gemma4_public_answer(buf)
+    if timing is not None:
+        timing["raw_model_output"] = "".join(raw_parts)
+
+
+async def _stream_gemma4_with_thinking(
+    achunk_stream,
+    *,
+    timing: Optional[dict] = None,
+    ollama_meta: Optional[list] = None,
+):
+    """Stream Gemma 4 thought text as it arrives, then stream the final answer."""
+    buf = ""
+    state = "pre"
+    raw_parts: list[str] = []
+    sent_thinking_label = False
+    sent_answer_label = False
+    start_keep = max(0, len(GEMMA4_THOUGHT_START) - 1)
+    end_keep = max(0, len(GEMMA4_THOUGHT_END) - 1)
+
+    def _note_first_public() -> None:
+        if timing is not None and "t_first_public" not in timing:
+            timing["t_first_public"] = time.perf_counter()
+
+    async for chunk in achunk_stream:
+        rm = getattr(chunk, "response_metadata", None) or {}
+        if rm and ollama_meta is not None:
+            ollama_meta[0] = rm
+        c = getattr(chunk, "content", None) or ""
+        raw_parts.append(c)
+        if not c:
+            continue
+
+        if state == "answer":
+            _note_first_public()
+            yield c
+            continue
+
+        buf += c
+        while buf:
+            if state == "pre":
+                si = buf.find(GEMMA4_THOUGHT_START)
+                if si == -1:
+                    if len(buf) > start_keep:
+                        emit, buf = buf[:-start_keep], buf[-start_keep:] if start_keep else ""
+                        if emit:
+                            _note_first_public()
+                            yield emit
+                    break
+                before = buf[:si]
+                if before:
+                    _note_first_public()
+                    yield before
+                buf = buf[si + len(GEMMA4_THOUGHT_START) :]
+                state = "thought"
+                if not sent_thinking_label:
+                    sent_thinking_label = True
+                    yield "\n\nThinking:\n"
+                continue
+
+            if state == "thought":
+                ei = buf.find(GEMMA4_THOUGHT_END)
+                if ei == -1:
+                    if len(buf) > end_keep:
+                        emit, buf = buf[:-end_keep], buf[-end_keep:] if end_keep else ""
+                        if emit:
+                            yield emit
+                    break
+                thought = buf[:ei]
+                if thought:
+                    yield thought
+                buf = buf[ei + len(GEMMA4_THOUGHT_END) :]
+                state = "answer"
+                if not sent_answer_label:
+                    sent_answer_label = True
+                    yield "\n\nAnswer:\n"
+                if buf:
+                    _note_first_public()
+                    yield buf
+                    buf = ""
+                break
+
+    if buf:
+        _note_first_public()
+        yield buf
     if timing is not None:
         timing["raw_model_output"] = "".join(raw_parts)
 
@@ -853,20 +938,32 @@ async def _ollama_chat_stream_chunks(
     if timing is not None:
         timing["t_start"] = t_start
     ollama_meta: list = [None]
-    if _is_gemma4_model(model):
-        async for part in _stream_strip_gemma4_thought(stream, timing=timing, ollama_meta=ollama_meta):
+    if _is_gemma4_model(model) and thinking:
+        async for part in _stream_gemma4_with_thinking(stream, timing=timing, ollama_meta=ollama_meta):
             yield part
     else:
         raw_parts: list[str] = []
+        sent_thinking_label = False
+        sent_answer_label = False
         async for chunk in stream:
             rm = getattr(chunk, "response_metadata", None) or {}
             if rm:
                 ollama_meta[0] = rm
-            raw_parts.append(chunk.content or "")
-            if chunk.content:
+            reasoning = (getattr(chunk, "additional_kwargs", None) or {}).get("reasoning_content")
+            content = chunk.content or ""
+            raw_parts.append((reasoning or "") + content)
+            if reasoning:
+                if not sent_thinking_label:
+                    sent_thinking_label = True
+                    yield "\n\nThinking:\n"
+                yield reasoning
+            if content:
+                if sent_thinking_label and not sent_answer_label:
+                    sent_answer_label = True
+                    yield "\n\nAnswer:\n"
                 if timing is not None and "t_first_public" not in timing:
                     timing["t_first_public"] = time.perf_counter()
-                yield chunk.content
+                yield content
         if timing is not None:
             timing["raw_model_output"] = "".join(raw_parts)
     if timing is not None:
@@ -1226,7 +1323,7 @@ async def chat_completion(request: ChatRequest):
             except Exception as e:
                 yield f"\n[Error: {str(e)}]"
 
-        return StreamingResponse(generate_cloud(), media_type="text/plain")
+        return _plain_text_streaming_response(generate_cloud())
 
     # Prevent using the embedding-only model as a chat model.
     if request.model == RAG_EMBEDDING_MODEL:
@@ -1361,7 +1458,7 @@ async def chat_completion(request: ChatRequest):
         except Exception as e:
             yield f"\n[Error: {str(e)}]"
 
-    return StreamingResponse(generate_response(), media_type="text/plain")
+    return _plain_text_streaming_response(generate_response())
 
 
 @app.get(
@@ -1516,7 +1613,7 @@ async def cloud_chat(request: CloudChatRequest):
     if not request.api_key:
         raise HTTPException(status_code=400, detail="API key is required for cloud providers")
     streamer = CLOUD_STREAMERS[request.provider]
-    return StreamingResponse(streamer(request), media_type="text/plain")
+    return _plain_text_streaming_response(streamer(request))
 
 
 @app.get("/api/health")
@@ -1627,7 +1724,7 @@ def _api_usage_guide_html() -> str:
         <tr>
           <td><code>thinking</code></td>
           <td><code>POST /api/chat</code> with local Ollama (ignored if cloud).</td>
-          <td>boolean, default <code>true</code></td>
+          <td>boolean, default <code>false</code></td>
           <td>
             <strong>Non-Gemma:</strong> passed to LangChain <code>ChatOllama</code> as Ollama <code>think</code> / <code>reasoning</code> on each call.<br/>
             <strong>Gemma 4:</strong> if <code>true</code>, <code>&lt;|think|&gt;</code> is added to the RAG system message and thought text is stripped from the stream;
