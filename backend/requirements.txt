@@ -8,12 +8,26 @@ httpx==0.28.1
 python-multipart==0.0.24
 
 # LangChain + RAG
+langchain==0.3.27
 langchain-ollama==0.3.10
 langchain-openai==0.3.35
 langchain-core==0.3.83
 langchain-chroma==0.2.6
 langchain-text-splitters==0.3.11
 chromadb==1.5.2
+
+# Agents: file ingestion, vision OCR, web search, PDF generation
+pymupdf==1.25.1
+python-docx==1.1.2
+python-pptx==1.0.2
+openpyxl==3.1.5
+pillow==11.0.0
+pillow-heif==0.21.0
+beautifulsoup4==4.13.3
+lxml==5.3.0
+duckduckgo-search==7.3.0
+reportlab==4.2.5
+markdown==3.7
 
 # Dependencies (from pip freeze)
 annotated-doc==0.0.4

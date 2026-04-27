@@ -119,7 +119,7 @@ export default function Home() {
     google: 'gemini-2.5-flash',
   });
   const [showApiKey, setShowApiKey] = useState({ openai: false, anthropic: false, google: false });
-  const [settingsTab, setSettingsTab] = useState('local'); // 'local' | 'cloud' | 'rag' | 'embeddings'
+  const [settingsTab, setSettingsTab] = useState('local'); // 'local' | 'cloud' | 'rag' | 'embeddings' | 'agents'
   const [ragStatus, setRagStatus] = useState(null);
   const [ragError, setRagError] = useState(null);
   const [ragText, setRagText] = useState('');
@@ -136,6 +136,31 @@ export default function Home() {
   const [fileUploadProgress, setFileUploadProgress] = useState(null);
   const fileInputRef = useRef(null);
   const directoryInputRef = useRef(null);
+
+  // Insertion + education agents
+  const [agentsConfig, setAgentsConfig] = useState(null);
+  const [isInsertModalOpen, setIsInsertModalOpen] = useState(false);
+  const [insertProgress, setInsertProgress] = useState(null);
+  const [insertResults, setInsertResults] = useState([]);
+  const [insertLoading, setInsertLoading] = useState(false);
+  const [insertRejected, setInsertRejected] = useState([]);
+  const insertFileInputRef = useRef(null);
+
+  const [isEduModalOpen, setIsEduModalOpen] = useState(false);
+  const [eduTopic, setEduTopic] = useState('');
+  const [eduAudience, setEduAudience] = useState('intermediate learners');
+  const [eduFormat, setEduFormat] = useState('markdown');
+  const [eduUseWeb, setEduUseWeb] = useState(true);
+  const [eduExtraInstructions, setEduExtraInstructions] = useState('');
+  const [eduLoading, setEduLoading] = useState(false);
+  const [eduResult, setEduResult] = useState(null);
+  const [eduError, setEduError] = useState(null);
+
+  // Agent monitoring
+  const [agentRuns, setAgentRuns] = useState([]);
+  const [agentStats, setAgentStats] = useState(null);
+  const [agentFilter, setAgentFilter] = useState('all'); // 'all' | 'insertion' | 'education'
+  const [agentEvalDrafts, setAgentEvalDrafts] = useState({}); // runId -> {score, feedback}
 
   const [threadId, setThreadId] = useState(() =>
     typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `thread-${Date.now()}`
@@ -210,6 +235,34 @@ export default function Home() {
         .finally(() => setChunksLoading(false));
     }
   }, [isManageModalOpen, settingsTab]);
+
+  const loadAgentsConfig = useCallback(() => {
+    fetch('http://localhost:8000/api/agents/config')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => { if (data) setAgentsConfig(data); })
+      .catch(() => {});
+  }, []);
+
+  const refreshAgentMonitoring = useCallback(() => {
+    const q = agentFilter === 'all' ? '' : `?agent=${agentFilter}`;
+    fetch(`http://localhost:8000/api/agents/runs${q}${q ? '&' : '?'}limit=50`)
+      .then(r => r.ok ? r.json() : { runs: [] })
+      .then(data => setAgentRuns(data.runs || []))
+      .catch(() => setAgentRuns([]));
+    fetch(`http://localhost:8000/api/agents/stats${agentFilter === 'all' ? '' : `?agent=${agentFilter}`}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => setAgentStats(data))
+      .catch(() => setAgentStats(null));
+  }, [agentFilter]);
+
+  useEffect(() => { loadAgentsConfig(); }, [loadAgentsConfig]);
+
+  useEffect(() => {
+    if (!(isManageModalOpen && settingsTab === 'agents')) return;
+    refreshAgentMonitoring();
+    const id = setInterval(refreshAgentMonitoring, 4000);
+    return () => clearInterval(id);
+  }, [isManageModalOpen, settingsTab, refreshAgentMonitoring]);
 
   const refreshOllamaModelState = useCallback(() => {
     fetch('http://localhost:8000/api/models')
@@ -439,6 +492,101 @@ export default function Home() {
     }
   };
 
+  const allowedInsertExts = agentsConfig?.allowed_insertion_extensions || [
+    '.pdf', '.txt', '.md', '.jpg', '.jpeg', '.png', '.heic', '.json',
+    '.html', '.htm', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+  ];
+
+  const handleInsertFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    const accepted = [];
+    const rejected = [];
+    for (const f of files) {
+      const lower = (f.name || '').toLowerCase();
+      if (allowedInsertExts.some(ext => lower.endsWith(ext))) accepted.push(f);
+      else rejected.push(f.name);
+    }
+    setInsertRejected(rejected);
+    if (accepted.length === 0) {
+      setInsertProgress('No allowed files selected.');
+      return;
+    }
+    setInsertLoading(true);
+    setInsertProgress(`Uploading ${accepted.length} file(s)…`);
+    try {
+      const form = new FormData();
+      for (const f of accepted) form.append('files', f);
+      const r = await fetch('http://localhost:8000/api/agents/insertion/upload', {
+        method: 'POST',
+        body: form,
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data?.detail?.message || data?.detail || r.statusText);
+      setInsertResults(data.results || []);
+      setInsertRejected(prev => Array.from(new Set([...(prev || []), ...(data.rejected || [])])));
+      const stored = (data.results || []).reduce((acc, x) => acc + (x.stored_chunks || 0), 0);
+      setInsertProgress(`Processed ${data.processed || 0} file(s); stored ${stored} chunk(s).`);
+    } catch (err) {
+      setInsertProgress(`Error: ${err.message || err}`);
+    } finally {
+      setInsertLoading(false);
+      if (insertFileInputRef.current) insertFileInputRef.current.value = '';
+    }
+  };
+
+  const handleEducationGenerate = async () => {
+    if (!eduTopic.trim()) {
+      setEduError('Please enter a topic.');
+      return;
+    }
+    setEduError(null);
+    setEduLoading(true);
+    setEduResult(null);
+    try {
+      const r = await fetch('http://localhost:8000/api/agents/education/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          topic: eduTopic.trim(),
+          audience: eduAudience.trim() || 'intermediate learners',
+          format: eduFormat,
+          use_web: eduUseWeb,
+          extra_instructions: eduExtraInstructions.trim(),
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data?.detail || r.statusText);
+      setEduResult(data);
+    } catch (err) {
+      setEduError(err.message || String(err));
+    } finally {
+      setEduLoading(false);
+    }
+  };
+
+  const submitAgentEvaluation = async (run) => {
+    const draft = agentEvalDrafts[run.id] || {};
+    const score = draft.score === '' || draft.score === undefined ? null : Number(draft.score);
+    const feedback = (draft.feedback || '').trim();
+    if (score === null && !feedback) return;
+    try {
+      const r = await fetch('http://localhost:8000/api/agents/runs/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent: run.agent, run_id: run.id, score, feedback }),
+      });
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        throw new Error(data?.detail || r.statusText);
+      }
+      refreshAgentMonitoring();
+      setAgentEvalDrafts(prev => ({ ...prev, [run.id]: { score: '', feedback: '' } }));
+    } catch (err) {
+      alert(`Failed to save evaluation: ${err.message || err}`);
+    }
+  };
+
   return (
     <>
       <main className="container">
@@ -449,16 +597,40 @@ export default function Home() {
               <span>✨</span> Ollama Chat
             </div>
 
-            <button
-              onClick={() => setIsManageModalOpen(true)}
-              style={{ position: 'absolute', top: '10px', right: '15px', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}
-              title="Settings"
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="3"></circle>
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-              </svg>
-            </button>
+            <div style={{ position: 'absolute', top: '10px', right: '15px', display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+              <button
+                onClick={() => { setIsInsertModalOpen(true); setInsertProgress(null); setInsertResults([]); setInsertRejected([]); }}
+                style={{
+                  background: 'var(--accent-color, #2563eb)', color: 'white', border: 'none',
+                  padding: '0.35rem 0.75rem', borderRadius: '6px', cursor: 'pointer',
+                  fontSize: '0.8rem', fontWeight: 600,
+                }}
+                title="Insert documents into the knowledge base"
+              >
+                Insert
+              </button>
+              <button
+                onClick={() => { setIsEduModalOpen(true); setEduResult(null); setEduError(null); }}
+                style={{
+                  background: '#10b981', color: 'white', border: 'none',
+                  padding: '0.35rem 0.75rem', borderRadius: '6px', cursor: 'pointer',
+                  fontSize: '0.8rem', fontWeight: 600,
+                }}
+                title="Generate educational content"
+              >
+                Generate
+              </button>
+              <button
+                onClick={() => setIsManageModalOpen(true)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)' }}
+                title="Settings"
+              >
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="3"></circle>
+                  <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                </svg>
+              </button>
+            </div>
           </div>
 
           {/* Provider Tabs */}
@@ -737,6 +909,12 @@ export default function Home() {
                 className={`settings-tab ${settingsTab === 'embeddings' ? 'active' : ''}`}
               >
                 Embeddings & storage
+              </button>
+              <button
+                onClick={() => setSettingsTab('agents')}
+                className={`settings-tab ${settingsTab === 'agents' ? 'active' : ''}`}
+              >
+                Agents
               </button>
             </div>
 
@@ -1178,9 +1356,323 @@ export default function Home() {
                 </div>
               </div>
             )}
+
+            {/* Agents monitoring / evaluation Tab */}
+            {settingsTab === 'agents' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                  Monitor and evaluate the insertion and education agents. Models are configured in <code>backend/settings.json</code>.
+                </p>
+
+                {agentsConfig && (
+                  <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', background: 'var(--bg-secondary)', padding: '0.5rem 0.75rem', borderRadius: '6px', border: '1px solid var(--border)' }}>
+                    Insertion: <strong>{agentsConfig.insertion_agent_model}</strong> · Education: <strong>{agentsConfig.education_agent_model}</strong> · Embeddings: <strong>{agentsConfig.embedding_model}</strong>
+                  </div>
+                )}
+
+                <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+                  <label style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Filter:</label>
+                  {['all', 'insertion', 'education'].map(key => (
+                    <button
+                      key={key}
+                      onClick={() => setAgentFilter(key)}
+                      style={{
+                        padding: '0.3rem 0.7rem', borderRadius: '6px', fontSize: '0.8rem',
+                        background: agentFilter === key ? 'var(--accent-color, #2563eb)' : 'var(--bg-secondary)',
+                        color: agentFilter === key ? 'white' : 'var(--text-primary)',
+                        border: '1px solid var(--border)', cursor: 'pointer', fontWeight: 600,
+                      }}
+                    >
+                      {key}
+                    </button>
+                  ))}
+                  <button
+                    onClick={refreshAgentMonitoring}
+                    style={{ marginLeft: 'auto', padding: '0.3rem 0.7rem', borderRadius: '6px', fontSize: '0.8rem', background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', cursor: 'pointer' }}
+                  >
+                    Refresh
+                  </button>
+                </div>
+
+                {agentStats && (
+                  <div style={{ display: 'grid', gridTemplateColumns: agentFilter === 'all' ? '1fr 1fr' : '1fr', gap: '0.5rem' }}>
+                    {agentFilter === 'all' ? (
+                      <>
+                        <AgentStatsCard title="Insertion" stats={agentStats.insertion} />
+                        <AgentStatsCard title="Education" stats={agentStats.education} />
+                      </>
+                    ) : (
+                      <AgentStatsCard title={agentFilter} stats={agentStats} />
+                    )}
+                  </div>
+                )}
+
+                <div>
+                  <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.4rem' }}>Recent runs</div>
+                  {agentRuns.length === 0 ? (
+                    <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>No runs yet. Use the Insert or Generate buttons to create activity.</div>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', maxHeight: '340px', overflowY: 'auto', border: '1px solid var(--border)', borderRadius: '8px', padding: '0.4rem' }}>
+                      {agentRuns.map(run => {
+                        const draft = agentEvalDrafts[run.id] || { score: '', feedback: '' };
+                        const statusColor = run.status === 'ok' ? '#10b981' : run.status === 'error' ? '#ef4444' : '#f59e0b';
+                        return (
+                          <div key={run.id} style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '6px', padding: '0.5rem 0.6rem' }}>
+                            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.78rem' }}>
+                              <span style={{ color: statusColor, fontWeight: 700 }}>●</span>
+                              <span style={{ fontWeight: 600 }}>{run.agent}</span>
+                              <span style={{ color: 'var(--text-secondary)' }}>{run.action}</span>
+                              <span style={{ color: 'var(--text-secondary)', marginLeft: 'auto' }}>{run.duration_s != null ? `${run.duration_s}s` : run.status}</span>
+                            </div>
+                            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.2rem' }}>
+                              {run.started_at} · {(run.metadata?.filename) || run.metadata?.topic || run.metadata?.model || ''}
+                            </div>
+                            {run.metrics && Object.keys(run.metrics).length > 0 && (
+                              <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>
+                                {Object.entries(run.metrics).map(([k, v]) => (
+                                  <span key={k} style={{ marginRight: '0.6rem' }}>
+                                    <strong>{k}:</strong> {typeof v === 'string' ? v.slice(0, 80) : String(v)}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            {run.error && (
+                              <div style={{ fontSize: '0.75rem', color: '#fca5a5', marginTop: '0.2rem' }}>Error: {run.error}</div>
+                            )}
+                            {run.evaluation && (
+                              <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.2rem' }}>
+                                Eval: score {run.evaluation.score ?? '—'}{run.evaluation.feedback ? ` · ${run.evaluation.feedback}` : ''}
+                              </div>
+                            )}
+                            <div style={{ display: 'flex', gap: '0.3rem', marginTop: '0.4rem', alignItems: 'center' }}>
+                              <input
+                                type="number" min="0" max="5" step="0.5"
+                                placeholder="score 0-5"
+                                value={draft.score}
+                                onChange={e => setAgentEvalDrafts(prev => ({ ...prev, [run.id]: { ...(prev[run.id] || {}), score: e.target.value } }))}
+                                style={{ width: '85px', padding: '0.2rem 0.4rem', fontSize: '0.75rem', background: 'var(--bg-primary)', border: '1px solid var(--border)', borderRadius: '4px', color: 'var(--text-primary)' }}
+                              />
+                              <input
+                                type="text"
+                                placeholder="feedback"
+                                value={draft.feedback}
+                                onChange={e => setAgentEvalDrafts(prev => ({ ...prev, [run.id]: { ...(prev[run.id] || {}), feedback: e.target.value } }))}
+                                style={{ flex: 1, padding: '0.2rem 0.4rem', fontSize: '0.75rem', background: 'var(--bg-primary)', border: '1px solid var(--border)', borderRadius: '4px', color: 'var(--text-primary)' }}
+                              />
+                              <button
+                                onClick={() => submitAgentEvaluation(run)}
+                                style={{ padding: '0.2rem 0.6rem', fontSize: '0.75rem', background: 'var(--accent-color, #2563eb)', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 600 }}
+                              >
+                                Save
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Insertion Modal */}
+      {isInsertModalOpen && (
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999 }}>
+          <div style={{ backgroundColor: '#161b22', padding: '2rem', borderRadius: '12px', minWidth: '460px', maxWidth: '560px', border: '1px solid var(--chat-border)', boxShadow: '0 10px 25px rgba(0,0,0,0.8)', color: 'var(--text-primary)', maxHeight: '80vh', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h2 style={{ margin: 0, fontSize: '1.15rem' }}>Insert documents</h2>
+              <button onClick={() => setIsInsertModalOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '1.2rem' }}>✕</button>
+            </div>
+            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: 0 }}>
+              The insertion agent stores files in <code>data/uploads</code> and embeds them into ChromaDB using <strong>{agentsConfig?.insertion_agent_model || 'the configured insertion model'}</strong>. Other file types are rejected.
+            </p>
+            <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+              Allowed: {allowedInsertExts.join(', ')}
+            </p>
+
+            <input
+              ref={insertFileInputRef}
+              type="file"
+              multiple
+              accept={allowedInsertExts.join(',')}
+              style={{ display: 'none' }}
+              onChange={(e) => handleInsertFiles(e.target.files)}
+            />
+            <button
+              onClick={() => insertFileInputRef.current?.click()}
+              disabled={insertLoading}
+              style={{ padding: '0.5rem 1rem', borderRadius: '8px', fontWeight: 600, background: insertLoading ? 'var(--bg-secondary)' : 'var(--accent-color, #2563eb)', color: 'white', border: 'none', cursor: insertLoading ? 'not-allowed' : 'pointer' }}
+            >
+              {insertLoading ? 'Uploading…' : 'Choose files…'}
+            </button>
+
+            {insertProgress && (
+              <div style={{ fontSize: '0.85rem', marginTop: '0.75rem', color: 'var(--text-secondary)' }}>{insertProgress}</div>
+            )}
+            {insertRejected.length > 0 && (
+              <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#fca5a5' }}>
+                Rejected (unsupported types): {insertRejected.join(', ')}
+              </div>
+            )}
+            {insertResults.length > 0 && (
+              <div style={{ marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
+                {insertResults.map((r, i) => (
+                  <div key={i} style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '6px', padding: '0.5rem 0.6rem', fontSize: '0.82rem' }}>
+                    <div style={{ fontWeight: 600 }}>{r.file}</div>
+                    {r.error ? (
+                      <div style={{ color: '#fca5a5' }}>Error: {r.error}</div>
+                    ) : (
+                      <>
+                        <div style={{ color: 'var(--text-secondary)' }}>Stored chunks: {r.stored_chunks ?? 0}{r.fallback ? ' (fallback)' : ''}</div>
+                        {r.agent_output && <div style={{ color: 'var(--text-secondary)', marginTop: '0.2rem' }}>{r.agent_output.slice(0, 260)}</div>}
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Education Modal */}
+      {isEduModalOpen && (
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999 }}>
+          <div style={{ backgroundColor: '#161b22', padding: '2rem', borderRadius: '12px', minWidth: '520px', maxWidth: '620px', border: '1px solid var(--chat-border)', boxShadow: '0 10px 25px rgba(0,0,0,0.8)', color: 'var(--text-primary)', maxHeight: '85vh', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+              <h2 style={{ margin: 0, fontSize: '1.15rem' }}>Generate educational content</h2>
+              <button onClick={() => setIsEduModalOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '1.2rem' }}>✕</button>
+            </div>
+            <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', marginTop: 0 }}>
+              Education agent: <strong>{agentsConfig?.education_agent_model || 'configured'}</strong> with RAG over the local KB (embeddings: <strong>{agentsConfig?.embedding_model || 'configured'}</strong>) and optional web search.
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.7rem' }}>
+              <div>
+                <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Topic</label>
+                <input
+                  type="text"
+                  value={eduTopic}
+                  onChange={e => setEduTopic(e.target.value)}
+                  placeholder="e.g. Introduction to Kalman filters"
+                  className="chat-input"
+                  style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem' }}
+                />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem' }}>
+                <div>
+                  <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Audience</label>
+                  <input
+                    type="text"
+                    value={eduAudience}
+                    onChange={e => setEduAudience(e.target.value)}
+                    className="chat-input"
+                    style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem' }}
+                  />
+                </div>
+                <div>
+                  <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Format</label>
+                  <select
+                    value={eduFormat}
+                    onChange={e => setEduFormat(e.target.value)}
+                    className="chat-input"
+                    style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem', cursor: 'pointer' }}
+                  >
+                    <option value="markdown">markdown</option>
+                    <option value="html">html</option>
+                    <option value="json">json</option>
+                    <option value="pdf">pdf</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>Extra instructions (optional)</label>
+                <textarea
+                  value={eduExtraInstructions}
+                  onChange={e => setEduExtraInstructions(e.target.value)}
+                  rows={2}
+                  className="chat-input"
+                  style={{ width: '100%', padding: '0.5rem', marginTop: '0.25rem', resize: 'vertical' }}
+                />
+              </div>
+              <label style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '0.4rem', cursor: 'pointer' }}>
+                <input type="checkbox" checked={eduUseWeb} onChange={e => setEduUseWeb(e.target.checked)} />
+                Enable web search (DuckDuckGo)
+              </label>
+
+              <button
+                onClick={handleEducationGenerate}
+                disabled={eduLoading || !eduTopic.trim()}
+                style={{
+                  padding: '0.55rem 1rem', borderRadius: '8px', fontWeight: 600,
+                  background: eduLoading || !eduTopic.trim() ? 'var(--bg-secondary)' : '#10b981',
+                  color: eduLoading || !eduTopic.trim() ? 'var(--text-secondary)' : 'white',
+                  border: '1px solid var(--border)',
+                  cursor: eduLoading || !eduTopic.trim() ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {eduLoading ? 'Generating… (this may take a minute)' : 'Generate'}
+              </button>
+
+              {eduError && (
+                <div style={{ fontSize: '0.85rem', color: '#fca5a5' }}>Error: {eduError}</div>
+              )}
+              {eduResult && (
+                <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '8px', padding: '0.6rem 0.75rem', fontSize: '0.85rem' }}>
+                  <div style={{ fontWeight: 600 }}>Result ({eduResult.format})</div>
+                  {eduResult.output_path ? (
+                    <div style={{ color: 'var(--text-secondary)', margin: '0.25rem 0' }}>
+                      Saved to: <code>{eduResult.output_path}</code>{' '}
+                      <a
+                        href={`http://localhost:8000/api/agents/education/download?path=${encodeURIComponent(eduResult.output_path)}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ color: 'var(--accent-color, #60a5fa)', marginLeft: '0.35rem' }}
+                      >
+                        Download
+                      </a>
+                    </div>
+                  ) : (
+                    <div style={{ color: '#fca5a5' }}>The agent did not persist an output file. See agent message below.</div>
+                  )}
+                  {eduResult.plan && (
+                    <details style={{ marginTop: '0.4rem' }}>
+                      <summary style={{ cursor: 'pointer', color: 'var(--text-secondary)' }}>Plan (chain-of-thought)</summary>
+                      <pre style={{ whiteSpace: 'pre-wrap', fontSize: '0.78rem', marginTop: '0.3rem' }}>{eduResult.plan}</pre>
+                    </details>
+                  )}
+                  {eduResult.agent_output && (
+                    <details style={{ marginTop: '0.4rem' }}>
+                      <summary style={{ cursor: 'pointer', color: 'var(--text-secondary)' }}>Agent message</summary>
+                      <pre style={{ whiteSpace: 'pre-wrap', fontSize: '0.78rem', marginTop: '0.3rem' }}>{eduResult.agent_output}</pre>
+                    </details>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
     </>
+  );
+}
+
+function AgentStatsCard({ title, stats }) {
+  if (!stats) return null;
+  return (
+    <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '8px', padding: '0.6rem 0.75rem', fontSize: '0.8rem' }}>
+      <div style={{ fontWeight: 700, textTransform: 'capitalize', marginBottom: '0.2rem' }}>{title}</div>
+      <div style={{ color: 'var(--text-secondary)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.15rem 0.6rem' }}>
+        <span>Total</span><span>{stats.total_runs ?? 0}</span>
+        <span>OK</span><span style={{ color: '#10b981' }}>{stats.ok_runs ?? 0}</span>
+        <span>Errors</span><span style={{ color: '#ef4444' }}>{stats.error_runs ?? 0}</span>
+        <span>Running</span><span style={{ color: '#f59e0b' }}>{stats.running_runs ?? 0}</span>
+        <span>Success rate</span><span>{stats.success_rate ?? 0}%</span>
+        <span>Avg duration</span><span>{stats.avg_duration_s ?? 0}s</span>
+      </div>
+    </div>
   );
 }
