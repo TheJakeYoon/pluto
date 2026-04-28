@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -121,6 +122,74 @@ def _inject_custom_tool_instruction(messages: List[dict], tool_name: str, tool_d
     return out
 
 
+def _raw_message_text(raw: object) -> str:
+    if raw is None:
+        return ""
+    content = getattr(raw, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text", block)) if isinstance(block, dict) else str(block)
+            for block in content
+        ).strip()
+    return (str(content) if content is not None else "").strip()
+
+
+def _extract_json_text_from_assistant_content(text: str) -> str:
+    """Extract JSON from raw assistant text, including ```json fenced blocks."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t, flags=re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    # If prose leaked around JSON, take the broadest object/array span.
+    starts = [idx for idx in (t.find("{"), t.find("[")) if idx >= 0]
+    ends = [idx for idx in (t.rfind("}"), t.rfind("]")) if idx >= 0]
+    if starts and ends and max(ends) > min(starts):
+        return t[min(starts) : max(ends) + 1].strip()
+    return t
+
+
+def _array_wrapper_field_for_schema(parameters: dict) -> Optional[str]:
+    props = parameters.get("properties") if isinstance(parameters, dict) else None
+    if not isinstance(props, dict):
+        return None
+    for preferred in ("questions", "items", "batch", "practice_questions", "problems"):
+        spec = props.get(preferred)
+        if isinstance(spec, dict) and spec.get("type") == "array":
+            return preferred
+    array_fields = [
+        name
+        for name, spec in props.items()
+        if isinstance(spec, dict) and spec.get("type") == "array"
+    ]
+    return array_fields[0] if len(array_fields) == 1 else None
+
+
+def _coerce_plain_json_content_to_tool_args(raw: object, parameters: dict) -> Optional[dict]:
+    """Fallback when a model returns JSON text instead of a forced tool call."""
+    text = _raw_message_text(raw)
+    json_text = _extract_json_text_from_assistant_content(text)
+    if not json_text:
+        return None
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        try:
+            parsed = coerce_tool_arguments(json_text, latex_blob_fallback=False)
+        except Exception:
+            return None
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        field = _array_wrapper_field_for_schema(parameters)
+        if field:
+            return {field: parsed}
+    return None
+
+
 async def ollama_structured_chat_complete(
     model: str,
     messages: List[dict],
@@ -202,28 +271,33 @@ async def ollama_structured_chat_complete(
             ),
         )
     except (TypeError, ValueError, json.JSONDecodeError) as e:
-        snippet = ""
-        if raw is not None:
-            raw_c = getattr(raw, "content", None)
-            if isinstance(raw_c, str):
-                snippet = raw_c.strip()
-            elif isinstance(raw_c, list):
-                snippet = "".join(
-                    str(b.get("text", b)) if isinstance(b, dict) else str(b) for b in raw_c
-                ).strip()
+        if custom_tool and raw is not None:
+            fallback_args = _coerce_plain_json_content_to_tool_args(raw, params)
+            if fallback_args is not None:
+                args = fallback_args
+                _log.warning(
+                    "Ollama structured_output recovered custom tool args from plain assistant JSON (model=%s tool=%s).",
+                    model,
+                    default_tool_name,
+                )
             else:
-                snippet = (str(raw_c) if raw_c is not None else "").strip()
-            if snippet:
-                snippet = snippet.replace("\n", " ")
-                if len(snippet) > 420:
-                    snippet = snippet[:420] + " …"
-                snippet = f" Assistant text (excerpt): {snippet!r}."
-        raise ValueError(
-            f"Could not parse tool arguments for {default_tool_name!r} (model={model!r}): {e}. "
-            "If values contain LaTeX, ensure JSON strings use doubled backslashes (e.g. \\\\frac)."
-            f"{snippet}"
-        ) from e
-
+                args = None
+        else:
+            args = None
+        if args is None:
+            snippet = ""
+            if raw is not None:
+                snippet_text = _raw_message_text(raw)
+                if snippet_text:
+                    snippet = snippet_text.replace("\n", " ")
+                    if len(snippet) > 420:
+                        snippet = snippet[:420] + " …"
+                    snippet = f" Assistant text (excerpt): {snippet!r}."
+            raise ValueError(
+                f"Could not parse tool arguments for {default_tool_name!r} (model={model!r}): {e}. "
+                "If values contain LaTeX, ensure JSON strings use doubled backslashes (e.g. \\\\frac)."
+                f"{snippet}"
+            ) from e
     if raw is not None:
         raw_names = {
             (tc.get("name") or "").strip()

@@ -465,8 +465,8 @@ class ChatRequest(BaseModel):
         ),
     )
     rag_enabled: bool = Field(
-        True,
-        description="If true, retrieve relevant context from the shared ChromaDB knowledge base using LangChain before calling the chat model.",
+        False,
+        description="If true, retrieve relevant context from the shared ChromaDB knowledge base using LangChain before calling the chat model. Default false; RAG is opt-in per request.",
     )
     batch: bool = Field(
         False,
@@ -511,8 +511,8 @@ class CloudChatRequest(BaseModel):
     messages: List[ChatMessage] = Field(..., description="Chat history for the request.")
     api_key: str = Field(..., description="API key for this provider (sent from client; not used for server-key OpenAI/Anthropic on /api/chat).")
     rag_enabled: bool = Field(
-        True,
-        description="If true, retrieve relevant context from the shared ChromaDB knowledge base using LangChain before calling the cloud model.",
+        False,
+        description="If true, retrieve relevant context from the shared ChromaDB knowledge base using LangChain before calling the cloud model. Default false; RAG is opt-in per request.",
     )
     batch: bool = Field(
         False,
@@ -923,7 +923,7 @@ def _apply_instruction_to_last_user(messages: List[dict], instruction: Optional[
 
 
 def _build_ollama_lc_messages_with_rag(
-    messages: List[dict], *, thinking: bool = False, model: str = "", rag_enabled: bool = True
+    messages: List[dict], *, thinking: bool = False, model: str = "", rag_enabled: bool = False
 ) -> List:
     """RAG retrieve from latest user text, then LangChain messages + RAG system prefix."""
     last_user_content = None
@@ -1024,8 +1024,9 @@ def _build_ollama_lc_messages_with_rag(
     if thinking and _is_gemma4_model(model):
         first_system = SystemMessage(content=f"{GEMMA4_THINK_TRIGGER}\n{rag_system}")
         _api_timestamp_logger.info(
-            "Gemma 4 thinking enabled for model=%s: <|think|> prepended to RAG system message.",
+            "Gemma 4 thinking enabled for model=%s: <|think|> prepended to system message (rag_enabled=%s).",
             model,
+            rag_enabled,
         )
     return [first_system] + lc_messages
 
@@ -1035,7 +1036,7 @@ async def _ollama_chat_stream_chunks(
     messages: List[dict],
     *,
     thinking: bool = False,
-    rag_enabled: bool = True,
+    rag_enabled: bool = False,
     timing: Optional[dict] = None,
 ):
     """Yields text tokens from ChatOllama (RAG + streaming).
@@ -1104,7 +1105,7 @@ def _assistant_content_from_invoke(result) -> str:
     return str(c) if c is not None else ""
 
 
-async def _ollama_chat_complete_text(model: str, messages: List[dict], *, thinking: bool = False, rag_enabled: bool = True) -> str:
+async def _ollama_chat_complete_text(model: str, messages: List[dict], *, thinking: bool = False, rag_enabled: bool = False) -> str:
     """Single non-streaming completion (same RAG path as streaming)."""
     lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model, rag_enabled=rag_enabled)
     llm = ChatOllama(
@@ -1176,7 +1177,7 @@ def _messages_for_cloud_chat_with_rag(
     *,
     thinking: bool = False,
     model: str = "",
-    rag_enabled: bool = True,
+    rag_enabled: bool = False,
 ) -> List[dict]:
     """Same RAG context as local Ollama chat, formatted for OpenAI/Anthropic."""
     lc = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model, rag_enabled=rag_enabled)
@@ -1403,6 +1404,18 @@ async def chat_completion(request: ChatRequest):
 
     inferred_cloud = _infer_cloud_provider_from_model_id(request.model)
     use_cloud_llm = bool(request.cloud) or (inferred_cloud is not None)
+    _api_timestamp_logger.info(
+        "Chat request options: model=%s provider=%s stream=%s cloud=%s rag_enabled=%s thinking=%s reasoning=%s structured_output=%s batch=%s",
+        request.model,
+        inferred_cloud or ("cloud" if request.cloud else "ollama"),
+        request.stream,
+        use_cloud_llm,
+        request.rag_enabled,
+        request.thinking,
+        request.reasoning,
+        bool(request.structured_output),
+        request.batch,
+    )
 
     if use_cloud_llm:
         if request.structured_tool is not None:
@@ -1845,6 +1858,14 @@ async def cloud_chat(request: CloudChatRequest):
         raise HTTPException(status_code=400, detail=f"Unknown provider: {request.provider}")
     if not request.api_key:
         raise HTTPException(status_code=400, detail="API key is required for cloud providers")
+    _api_timestamp_logger.info(
+        "Cloud chat request options: provider=%s model=%s rag_enabled=%s reasoning=%s batch=%s",
+        request.provider,
+        request.model,
+        request.rag_enabled,
+        request.reasoning,
+        request.batch,
+    )
     streamer = CLOUD_STREAMERS[request.provider]
     raw_messages = [{"role": m.role, "content": m.content} for m in request.messages]
     try:
@@ -2052,6 +2073,12 @@ def _api_usage_guide_html() -> str:
     </table>
 
     <h3>Chat</h3>
+    <p class="muted">
+      RAG is <strong>opt-in</strong> for chat requests. By default, <code>rag_enabled</code> is <code>false</code>,
+      so the server does not embed the query or retrieve ChromaDB context. Set <code>rag_enabled: true</code>
+      on <code>POST /api/chat</code> or <code>POST /api/cloud/chat</code> to retrieve from the shared
+      knowledge base before calling the model.
+    </p>
     <table class="guide">
       <thead><tr><th>Method &amp; path</th><th>Purpose</th><th>Key inputs</th></tr></thead>
       <tbody>
@@ -2064,7 +2091,7 @@ def _api_usage_guide_html() -> str:
             <strong>stream</strong> — <code>true</code> → <code>text/plain</code> stream;
             <code>false</code> → JSON <code>message</code>, <code>model</code>, and if cloud <code>provider</code>.<br/>
             <strong>cloud</strong> — force cloud when model id is ambiguous.<br/>
-            <strong>rag_enabled</strong> — default <code>true</code>; set <code>false</code> to skip LangChain/Chroma retrieval for this request.<br/>
+            <strong>rag_enabled</strong> — default <code>false</code>; set <code>true</code> to use LangChain/Chroma retrieval for this request.<br/>
             <strong>batch</strong> — OpenAI cloud only; set <code>true</code> to submit an asynchronous OpenAI Batch API job instead of a live response.<br/>
             <strong>thread_id</strong> — optional; server stores last messages per id (see GET thread).<br/>
             <strong>instruction</strong> — optional; prepended to last user message for this request only.<br/>
@@ -2078,7 +2105,7 @@ def _api_usage_guide_html() -> str:
           <td>
             <strong>provider</strong> — <code>openai</code> | <code>anthropic</code> | <code>google</code>.<br/>
             <strong>model</strong>, <strong>messages</strong>, <strong>api_key</strong>.<br/>
-            <strong>rag_enabled</strong> — default <code>true</code>; same shared Chroma RAG path as <code>/api/chat</code>.<br/>
+            <strong>rag_enabled</strong> — default <code>false</code>; set <code>true</code> to use the same shared Chroma RAG path as <code>/api/chat</code>.<br/>
             <strong>reasoning</strong> — optional; OpenAI only (same semantics as <code>/api/chat</code>).<br/>
             <strong>batch</strong> — OpenAI only; submit to OpenAI Batch API and return a JSON batch object.
           </td>

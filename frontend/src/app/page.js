@@ -317,8 +317,8 @@ export default function Home() {
   const [selectedModel, setSelectedModel] = useState('gpt-oss:20b');
   /** Ollama: reasoning / thinking; on by default (Gemma 4 may hide thought text before the answer streams). */
   const [ollamaThinking, setOllamaThinking] = useState(true);
-  /** Shared ChromaDB RAG context; on by default for every provider. */
-  const [ragEnabled, setRagEnabled] = useState(true);
+  /** Shared ChromaDB RAG context; off by default and enabled per request. */
+  const [ragEnabled, setRagEnabled] = useState(false);
   /** OpenAI reasoning models: maps to LangChain ChatOpenAI reasoning_effort (none = omit). */
   const [openaiReasoning, setOpenaiReasoning] = useState('none');
   /** OpenAI Batch API: async generation with lower cost / 24h completion window. */

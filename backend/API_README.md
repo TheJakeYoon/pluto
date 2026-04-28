@@ -72,7 +72,7 @@ Do not commit real keys; keep `.env.local` out of version control.
 ## Chat Endpoints
 
 ### `POST /api/chat`
-Chat with optional **local Ollama** (default) or **cloud** (OpenAI / Anthropic) on the same endpoint. RAG context from the vector store is applied in both modes when retrieval runs.
+Chat with optional **local Ollama** (default) or **cloud** (OpenAI / Anthropic) on the same endpoint. RAG context from the vector store is optional and is applied only when `rag_enabled` is true.
 
 - Content-Type: `application/json`
 - Response:
@@ -91,7 +91,7 @@ Request body:
   "instruction": "Optional. Prepended to the start of the last user message for this request (affects model input and RAG query).",
   "stream": true,
   "cloud": false,
-  "rag_enabled": true,
+  "rag_enabled": false,
   "batch": false
 }
 ```
@@ -115,7 +115,7 @@ When **`cloud` is `false`** and the model is inferred as cloud (e.g. `gpt-5.4`),
 
 Cloud chat uses the same RAG pipeline as local chat (retrieval + merged system context), then calls the provider’s chat API. Streaming uses the same wire format as local chat (`text/plain` chunks).
 
-Set **`rag_enabled: false`** to skip LangChain/Chroma retrieval for a request.
+Set **`rag_enabled: true`** to opt into LangChain/Chroma retrieval for a request.
 
 **Local Ollama notes:**
 
@@ -255,7 +255,7 @@ Request body:
     { "role": "user", "content": "Say hello." }
   ],
   "api_key": "YOUR_API_KEY",
-  "rag_enabled": true,
+  "rag_enabled": false,
   "batch": false
 }
 ```
