@@ -19,8 +19,8 @@ AGENT_LOG_DIR = os.path.join(_BASE_DIR, "agents", "logs")
 for _d in (DATA_DIR, UPLOADS_DIR, GENERATED_DIR, AGENT_LOG_DIR):
     os.makedirs(_d, exist_ok=True)
 
-# Shared Chroma collection for agent-inserted documents (separate from chatbot_kb RAG).
-INSERTION_COLLECTION = os.environ.get("AGENT_INSERTION_COLLECTION", "agent_kb")
+# Shared Chroma collection used by RAG text, insertion uploads/URLs, and storage browsing.
+INSERTION_COLLECTION = os.environ.get("AGENT_INSERTION_COLLECTION") or os.environ.get("RAG_COLLECTION") or "agent_kb"
 
 
 def _load_settings() -> dict:

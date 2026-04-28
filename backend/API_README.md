@@ -4,6 +4,7 @@ This backend is a FastAPI service for:
 - Local Ollama chat via `POST /api/chat` (optional RAG; streaming or JSON)
 - The same `POST /api/chat` with `cloud: true` for OpenAI (GPT) or Anthropic (Opus/Sonnet) using server-side API keys
 - Standalone cloud streaming via `POST /api/cloud/chat` (OpenAI, Anthropic, Google; API key in the request body)
+- Optional OpenAI Batch generation for asynchronous, lower-cost cloud jobs
 - Model management (list, load, stop, loaded list)
 - RAG knowledge-base ingestion and chunk management
 - Basic health and system info
@@ -89,7 +90,9 @@ Request body:
   "thread_id": "optional-thread-id",
   "instruction": "Optional. Prepended to the start of the last user message for this request (affects model input and RAG query).",
   "stream": true,
-  "cloud": false
+  "cloud": false,
+  "rag_enabled": true,
+  "batch": false
 }
 ```
 
@@ -112,6 +115,8 @@ When **`cloud` is `false`** and the model is inferred as cloud (e.g. `gpt-5.4`),
 
 Cloud chat uses the same RAG pipeline as local chat (retrieval + merged system context), then calls the provider’s chat API. Streaming uses the same wire format as local chat (`text/plain` chunks).
 
+Set **`rag_enabled: false`** to skip LangChain/Chroma retrieval for a request.
+
 **Local Ollama notes:**
 
 - Only **`default_chat_model`** may be used without an explicit **Load** in Manage / `POST /api/models/load`. Any other Ollama model must already be running (`ollama ps`); otherwise the server returns **`400`**.
@@ -121,6 +126,7 @@ Cloud chat uses the same RAG pipeline as local chat (retrieval + merged system c
 
 - If the required API key is missing, the server returns **`503`**.
 - Non-stream JSON responses include extra fields: `"cloud": true` and `"provider": "openai"` or `"anthropic"`.
+- **OpenAI only:** set **`batch: true`** to submit the request to the OpenAI Batch API instead of waiting for a live response. Batch jobs are asynchronous, use the `/v1/chat/completions` batch endpoint, and can take up to 24 hours.
 
 Streaming example:
 
@@ -178,6 +184,41 @@ curl -N -X POST http://localhost:8000/api/chat \
   }'
 ```
 
+OpenAI Batch example (requires `OPENAI_API_KEY`):
+
+```bash
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cloud": true,
+    "model": "gpt-4o",
+    "messages": [{"role":"user","content":"Generate a study guide from the retrieved context."}],
+    "stream": true,
+    "rag_enabled": true,
+    "batch": true
+  }'
+```
+
+Batch response shape:
+
+```json
+{
+  "batch": true,
+  "batch_status": {
+    "id": "batch_abc123",
+    "status": "validating",
+    "input_file_id": "file_abc123"
+  },
+  "model": "gpt-4o",
+  "cloud": true,
+  "provider": "openai",
+  "message": {
+    "role": "assistant",
+    "content": "OpenAI batch submitted: batch_abc123 (status: validating)."
+  }
+}
+```
+
 Notes:
 - `model` is optional in JSON for **local** chat; if omitted, the server uses **`default_chat_model`** from **`settings.json`** next to `main.py` (falls back to **`gpt-oss:20b`**). For **`cloud: true`**, set `model` to a real OpenAI or Anthropic model id.
 - `thread_id` is optional and used for short-term in-memory thread history.
@@ -213,7 +254,9 @@ Request body:
   "messages": [
     { "role": "user", "content": "Say hello." }
   ],
-  "api_key": "YOUR_API_KEY"
+  "api_key": "YOUR_API_KEY",
+  "rag_enabled": true,
+  "batch": false
 }
 ```
 
@@ -228,6 +271,39 @@ curl -N -X POST http://localhost:8000/api/cloud/chat \
     "messages": [{"role":"user","content":"Give me 3 bullet points about caching."}],
     "api_key": "YOUR_API_KEY"
   }'
+```
+
+OpenAI Batch is also available on this endpoint with a browser-supplied key:
+
+```bash
+curl -X POST http://localhost:8000/api/cloud/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "messages": [{"role":"user","content":"Summarize the retrieved documents."}],
+    "api_key": "YOUR_API_KEY",
+    "rag_enabled": true,
+    "batch": true
+  }'
+```
+
+---
+
+### `GET /api/openai/batches/{batch_id}`
+Check OpenAI Batch status. Uses `OPENAI_API_KEY` from the backend environment by default; pass `?api_key=...` only for browser-key workflows.
+
+```bash
+curl http://localhost:8000/api/openai/batches/batch_abc123
+```
+
+---
+
+### `GET /api/openai/batches/{batch_id}/results`
+Fetch completed OpenAI Batch output/error JSONL. The batch must have an `output_file_id` or `error_file_id`.
+
+```bash
+curl http://localhost:8000/api/openai/batches/batch_abc123/results
 ```
 
 ---
@@ -318,23 +394,6 @@ Example:
 curl -X POST http://localhost:8000/api/rag/documents \
   -H "Content-Type: application/json" \
   -d '{"texts":["FastAPI is a modern Python web framework."]}'
-```
-
----
-
-### `POST /api/rag/documents/files`
-Upload `.md` and `.txt` files for ingestion.
-
-- Content-Type: `multipart/form-data`
-- Field name: `files`
-- Multiple files supported
-
-Example:
-
-```bash
-curl -X POST http://localhost:8000/api/rag/documents/files \
-  -F "files=@/absolute/path/notes.md" \
-  -F "files=@/absolute/path/todo.txt"
 ```
 
 ---

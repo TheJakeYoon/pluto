@@ -6,7 +6,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request, Query, Path
+from fastapi import FastAPI, HTTPException, Request, Query, Path
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -18,6 +18,8 @@ import subprocess
 import httpx
 import json
 import time
+import uuid
+import io
 
 import langchain_py314_shim
 
@@ -39,7 +41,8 @@ from agents import agents_router
 # ChromaDB persist directory under project root / database
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _SETTINGS_PATH = os.path.join(_BASE_DIR, "settings.json")
-_DB_DIR = os.path.join(_BASE_DIR, "..", "database", "chroma")
+# Absolute path so Chroma PersistentClient always writes the same on-disk DB regardless of process cwd.
+_DB_DIR = os.path.abspath(os.path.join(_BASE_DIR, "..", "database", "chroma"))
 os.makedirs(_DB_DIR, exist_ok=True)
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(_BASE_DIR, ".."))
@@ -83,10 +86,32 @@ def _default_chat_model_from_settings(settings: dict) -> str:
             return first.strip()
     return "gpt-oss:20b"
 
+
+def _first_setting_string(settings: dict, key: str) -> Optional[str]:
+    value = settings.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    return None
+
+
 # RAG: embedding model for vector store (Ollama). Use one already loaded, e.g. embeddinggemma:latest
-RAG_EMBEDDING_MODEL = os.environ.get("RAG_EMBEDDING_MODEL", "embeddinggemma:latest")
-RAG_COLLECTION = "chatbot_kb"
-RAG_TOP_K = 4
+RAG_EMBEDDING_MODEL = (
+    os.environ.get("RAG_EMBEDDING_MODEL")
+    or _first_setting_string(_backend_settings, "embedding_model")
+    or "embeddinggemma:latest"
+)
+RAG_COLLECTION = os.environ.get("RAG_COLLECTION") or os.environ.get("AGENT_INSERTION_COLLECTION") or "agent_kb"
+RAG_TOP_K = 8
+RAG_MMR_FETCH_K = max(RAG_TOP_K * 4, 24)
+# Chunked inserts: avoids oversized single embed calls to Ollama and large single upserts to Chroma.
+try:
+    _RAG_ADD_BATCH_SIZE = max(1, int(os.environ.get("RAG_ADD_BATCH_SIZE", "64")))
+except ValueError:
+    _RAG_ADD_BATCH_SIZE = 64
 
 # Keep chat models resident between requests (-1 = indefinite). Override with OLLAMA_KEEP_ALIVE if needed.
 OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "-1")
@@ -151,6 +176,17 @@ def _get_vector_store():
             persist_directory=_DB_DIR,
         )
     return _vector_store
+
+
+def _directory_size_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -418,15 +454,23 @@ class ChatRequest(BaseModel):
         description="If true, use cloud LLM with OPENAI_API_KEY or ANTHROPIC_API_KEY from server env / .env.local.",
     )
     thinking: bool = Field(
-        False,
+        True,
         description=(
-            "Ollama (local) only; ignored for cloud. Default false so chat visibly streams by default. "
+            "Ollama (local) only; ignored for cloud. Default true so models that support it use thinking/reasoning by default. "
             "Maps to LangChain ChatOllama: for non-Gemma models, passed as "
             "invoke/stream kwarg reasoning (bool) so Ollama exposes thinking per https://ollama.com/search?c=thinking . "
             "Gemma 4: when true, <|think|> is prepended on the RAG system block and the server strips the thought "
             "channel from streamed/plain text; when structured_output is true, reasoning=false is sent to Ollama only "
             "if thinking is false (reliable tool JSON)."
         ),
+    )
+    rag_enabled: bool = Field(
+        True,
+        description="If true, retrieve relevant context from the shared ChromaDB knowledge base using LangChain before calling the chat model.",
+    )
+    batch: bool = Field(
+        False,
+        description="OpenAI cloud only. If true, submit this request to OpenAI Batch API and return a batch id instead of a live response.",
     )
     reasoning: OpenAIReasoningEffort = Field(
         None,
@@ -466,6 +510,14 @@ class CloudChatRequest(BaseModel):
     model: str = Field(..., description="Provider-specific model id.")
     messages: List[ChatMessage] = Field(..., description="Chat history for the request.")
     api_key: str = Field(..., description="API key for this provider (sent from client; not used for server-key OpenAI/Anthropic on /api/chat).")
+    rag_enabled: bool = Field(
+        True,
+        description="If true, retrieve relevant context from the shared ChromaDB knowledge base using LangChain before calling the cloud model.",
+    )
+    batch: bool = Field(
+        False,
+        description="OpenAI provider only. If true, submit this request to OpenAI Batch API and return a batch id instead of streaming.",
+    )
     reasoning: OpenAIReasoningEffort = Field(
         None,
         description='OpenAI with provider "openai" only: same as POST /api/chat reasoning → ChatOpenAI.reasoning_effort.',
@@ -871,7 +923,7 @@ def _apply_instruction_to_last_user(messages: List[dict], instruction: Optional[
 
 
 def _build_ollama_lc_messages_with_rag(
-    messages: List[dict], *, thinking: bool = False, model: str = ""
+    messages: List[dict], *, thinking: bool = False, model: str = "", rag_enabled: bool = True
 ) -> List:
     """RAG retrieve from latest user text, then LangChain messages + RAG system prefix."""
     last_user_content = None
@@ -881,16 +933,77 @@ def _build_ollama_lc_messages_with_rag(
             break
     context_parts = []
     query = (last_user_content or "").strip() or "general"
-    try:
-        vs = _get_vector_store()
-        retriever = vs.as_retriever(search_kwargs={"k": RAG_TOP_K})
-        docs = retriever.invoke(query)
-        if docs:
-            context_parts = [doc.page_content for doc in docs]
-    except HTTPException:
-        raise
-    except Exception:
-        pass
+    if rag_enabled:
+        try:
+            vs = _get_vector_store()
+            similarity_retriever = vs.as_retriever(search_type="similarity", search_kwargs={"k": RAG_TOP_K})
+            mmr_retriever = vs.as_retriever(
+                search_type="mmr",
+                search_kwargs={"k": RAG_TOP_K, "fetch_k": RAG_MMR_FETCH_K, "lambda_mult": 0.5},
+            )
+            similarity_docs = similarity_retriever.invoke(query)
+            mmr_docs = mmr_retriever.invoke(query)
+            docs = []
+            seen = set()
+            for doc in [*(similarity_docs or []), *(mmr_docs or [])]:
+                key = getattr(doc, "id", None) or (
+                    (getattr(doc, "metadata", None) or {}).get("source"),
+                    (getattr(doc, "metadata", None) or {}).get("chunk_index"),
+                    doc.page_content[:120],
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                docs.append(doc)
+                if len(docs) >= RAG_TOP_K:
+                    break
+            if docs:
+                for idx, doc in enumerate(docs, start=1):
+                    meta = getattr(doc, "metadata", None) or {}
+                    source_bits = []
+                    if meta.get("source"):
+                        source_bits.append(f"source={meta.get('source')}")
+                    if meta.get("title"):
+                        source_bits.append(f"title={meta.get('title')}")
+                    if meta.get("subject"):
+                        source_bits.append(f"subject={meta.get('subject')}")
+                    if meta.get("section"):
+                        source_bits.append(f"section={meta.get('section')}")
+                    if meta.get("page_range"):
+                        source_bits.append(f"pages={meta.get('page_range')}")
+                    if meta.get("source_url"):
+                        source_bits.append(f"url={meta.get('source_url')}")
+                    prefix = f"[Context {idx}"
+                    if source_bits:
+                        prefix += " | " + " | ".join(str(x) for x in source_bits if x)
+                    prefix += "]"
+                    context_parts.append(f"{prefix}\n{doc.page_content}")
+            _api_timestamp_logger.info(
+                "RAG retrieval complete query_chars=%d collection=%s top_k=%d similarity_docs=%d mmr_docs=%d merged_docs=%d context_chars=%d",
+                len(query),
+                RAG_COLLECTION,
+                RAG_TOP_K,
+                len(similarity_docs or []),
+                len(mmr_docs or []),
+                len(docs or []),
+                sum(len(x) for x in context_parts),
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            _api_timestamp_logger.exception(
+                "RAG retrieval failed collection=%s embedding_model=%s query_chars=%d",
+                RAG_COLLECTION,
+                RAG_EMBEDDING_MODEL,
+                len(query),
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=f"RAG retrieval failed using embedding model '{RAG_EMBEDDING_MODEL}' and collection '{RAG_COLLECTION}': {e}",
+            ) from e
+    else:
+        _api_timestamp_logger.info("RAG retrieval skipped by request query_chars=%d", len(query))
+
     if context_parts:
         rag_system = (
             "You must treat the following context as the only source of truth. "
@@ -899,6 +1012,8 @@ def _build_ollama_lc_messages_with_rag(
             "Do not contradict or go beyond the context.\n\n"
             "Context:\n" + "\n\n---\n\n".join(context_parts)
         )
+    elif not rag_enabled:
+        rag_system = "Knowledge base retrieval (RAG) is disabled for this request. Answer from your general knowledge."
     else:
         rag_system = (
             "No relevant context from the knowledge base was found for this query. "
@@ -920,6 +1035,7 @@ async def _ollama_chat_stream_chunks(
     messages: List[dict],
     *,
     thinking: bool = False,
+    rag_enabled: bool = True,
     timing: Optional[dict] = None,
 ):
     """Yields text tokens from ChatOllama (RAG + streaming).
@@ -927,7 +1043,7 @@ async def _ollama_chat_stream_chunks(
     If ``timing`` is a dict, it is filled with: ``t_start``, ``t_end``, ``t_first_public`` (perf_counter
     values), and ``ollama_response_metadata`` (last chunk's ``response_metadata`` from LangChain).
     """
-    lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model)
+    lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model, rag_enabled=rag_enabled)
     llm = ChatOllama(
         model=model,
         keep_alive=OLLAMA_KEEP_ALIVE,
@@ -988,9 +1104,9 @@ def _assistant_content_from_invoke(result) -> str:
     return str(c) if c is not None else ""
 
 
-async def _ollama_chat_complete_text(model: str, messages: List[dict], *, thinking: bool = False) -> str:
+async def _ollama_chat_complete_text(model: str, messages: List[dict], *, thinking: bool = False, rag_enabled: bool = True) -> str:
     """Single non-streaming completion (same RAG path as streaming)."""
-    lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model)
+    lc_messages = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model, rag_enabled=rag_enabled)
     llm = ChatOllama(
         model=model,
         keep_alive=OLLAMA_KEEP_ALIVE,
@@ -1060,9 +1176,10 @@ def _messages_for_cloud_chat_with_rag(
     *,
     thinking: bool = False,
     model: str = "",
+    rag_enabled: bool = True,
 ) -> List[dict]:
     """Same RAG context as local Ollama chat, formatted for OpenAI/Anthropic."""
-    lc = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model)
+    lc = _build_ollama_lc_messages_with_rag(messages, thinking=thinking, model=model, rag_enabled=rag_enabled)
     flat = _langchain_to_openai_compatible_dicts(lc)
     return _collapse_system_messages(flat)
 
@@ -1133,6 +1250,93 @@ async def _openai_chat_complete_messages(
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _assistant_content_from_invoke(result)
+
+
+async def _openai_create_chat_batch(
+    *,
+    model: str,
+    messages: List[ChatMessage],
+    api_key: str,
+    reasoning_effort: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Submit one chat generation request to OpenAI Batch API and return its batch object."""
+    custom_id = f"chat-{uuid.uuid4()}"
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": m.role, "content": m.content} for m in messages],
+    }
+    if reasoning_effort:
+        body["reasoning_effort"] = reasoning_effort
+    payload = (
+        json.dumps(
+            {
+                "custom_id": custom_id,
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": body,
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
+        upload = await client.post(
+            "https://api.openai.com/v1/files",
+            headers=headers,
+            data={"purpose": "batch"},
+            files={"file": ("pluto-openai-batch.jsonl", io.BytesIO(payload), "application/jsonl")},
+        )
+        if upload.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"OpenAI batch file upload failed: {upload.text}")
+        file_data = upload.json()
+        input_file_id = file_data.get("id")
+        if not input_file_id:
+            raise HTTPException(status_code=502, detail=f"OpenAI batch file upload returned no id: {file_data}")
+        batch_metadata = {
+            "app": "pluto",
+            "kind": "chat",
+            "custom_id": custom_id,
+            **{k: str(v) for k, v in (metadata or {}).items() if v is not None},
+        }
+        batch = await client.post(
+            "https://api.openai.com/v1/batches",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "input_file_id": input_file_id,
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "24h",
+                "metadata": batch_metadata,
+            },
+        )
+        if batch.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"OpenAI batch creation failed: {batch.text}")
+        out = batch.json()
+        out["custom_id"] = custom_id
+        return out
+
+
+async def _openai_get_batch(batch_id: str, api_key: str) -> dict:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
+        r = await client.get(
+            f"https://api.openai.com/v1/batches/{batch_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"OpenAI batch status failed: {r.text}")
+        return r.json()
+
+
+async def _openai_get_file_text(file_id: str, api_key: str) -> str:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0)) as client:
+        r = await client.get(
+            f"https://api.openai.com/v1/files/{file_id}/content",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"OpenAI batch output fetch failed: {r.text}")
+        return r.text
 
 
 async def _anthropic_chat_complete_messages(model: str, messages: List[ChatMessage], api_key: str) -> str:
@@ -1226,6 +1430,7 @@ async def chat_completion(request: ChatRequest):
                 messages,
                 thinking=bool(request.thinking),
                 model=request.model,
+                rag_enabled=bool(request.rag_enabled),
             )
         except HTTPException:
             raise
@@ -1238,8 +1443,34 @@ async def chat_completion(request: ChatRequest):
             model=request.model,
             messages=chat_messages,
             api_key=api_key,
+            rag_enabled=request.rag_enabled,
+            batch=request.batch,
             reasoning=request.reasoning,
         )
+
+        if request.batch:
+            if provider != "openai":
+                raise HTTPException(status_code=400, detail="Batch generation is currently supported only for OpenAI cloud models.")
+            if want_structured_output:
+                raise HTTPException(status_code=400, detail="Batch generation is not supported with structured_output.")
+            batch = await _openai_create_chat_batch(
+                model=request.model,
+                messages=chat_messages,
+                api_key=api_key,
+                reasoning_effort=_openai_reasoning_effort_optional(request.reasoning),
+                metadata={"thread_id": thread_id or "", "rag_enabled": bool(request.rag_enabled)},
+            )
+            return {
+                "batch": True,
+                "batch_status": batch,
+                "model": request.model,
+                "cloud": True,
+                "provider": provider,
+                "message": {
+                    "role": "assistant",
+                    "content": f"OpenAI batch submitted: {batch.get('id')} (status: {batch.get('status')}).",
+                },
+            }
 
         if want_structured_output and request.stream:
             raise HTTPException(
@@ -1354,6 +1585,7 @@ async def chat_completion(request: ChatRequest):
                     messages,
                     thinking=bool(request.thinking),
                     model=request.model,
+                    rag_enabled=bool(request.rag_enabled),
                 )
             except HTTPException:
                 raise
@@ -1389,7 +1621,7 @@ async def chat_completion(request: ChatRequest):
     if not request.stream:
         try:
             full_content = await _ollama_chat_complete_text(
-                request.model, messages, thinking=bool(request.thinking)
+                request.model, messages, thinking=bool(request.thinking), rag_enabled=bool(request.rag_enabled)
             )
             if thread_id:
                 stored = [{"role": msg.role, "content": msg.content} for msg in request.messages]
@@ -1412,6 +1644,7 @@ async def chat_completion(request: ChatRequest):
                 request.model,
                 messages,
                 thinking=bool(request.thinking),
+                rag_enabled=bool(request.rag_enabled),
                 timing=timing,
             ):
                 full_content += part
@@ -1613,7 +1846,80 @@ async def cloud_chat(request: CloudChatRequest):
     if not request.api_key:
         raise HTTPException(status_code=400, detail="API key is required for cloud providers")
     streamer = CLOUD_STREAMERS[request.provider]
-    return _plain_text_streaming_response(streamer(request))
+    raw_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    try:
+        rag_messages = _messages_for_cloud_chat_with_rag(raw_messages, model=request.model, rag_enabled=bool(request.rag_enabled))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"RAG retrieval failed: {e}") from e
+    rag_request = CloudChatRequest(
+        provider=request.provider,
+        model=request.model,
+        messages=[ChatMessage(role=m["role"], content=str(m.get("content") or "")) for m in rag_messages],
+        api_key=request.api_key,
+        rag_enabled=request.rag_enabled,
+        batch=request.batch,
+        reasoning=request.reasoning,
+    )
+    _api_timestamp_logger.info(
+        "Cloud chat request using LangChain RAG provider=%s model=%s original_messages=%d rag_messages=%d",
+        request.provider,
+        request.model,
+        len(request.messages),
+        len(rag_request.messages),
+    )
+    if request.batch:
+        if request.provider != "openai":
+            raise HTTPException(status_code=400, detail="Batch generation is currently supported only for OpenAI cloud models.")
+        batch = await _openai_create_chat_batch(
+            model=request.model,
+            messages=rag_request.messages,
+            api_key=request.api_key,
+            reasoning_effort=_openai_reasoning_effort_optional(request.reasoning),
+            metadata={"rag_enabled": bool(request.rag_enabled), "source": "browser-key-cloud-chat"},
+        )
+        return JSONResponse(
+            {
+                "batch": True,
+                "batch_status": batch,
+                "model": request.model,
+                "cloud": True,
+                "provider": request.provider,
+                "message": {
+                    "role": "assistant",
+                    "content": f"OpenAI batch submitted: {batch.get('id')} (status: {batch.get('status')}).",
+                },
+            }
+        )
+    return _plain_text_streaming_response(streamer(rag_request))
+
+
+@app.get("/api/openai/batches/{batch_id}")
+async def openai_batch_status(
+    batch_id: str,
+    api_key: Optional[str] = Query(None, description="Optional browser-supplied OpenAI API key; otherwise backend OPENAI_API_KEY is used."),
+):
+    key = (api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
+    if not key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is required to check OpenAI batch status.")
+    return await _openai_get_batch(batch_id, key)
+
+
+@app.get("/api/openai/batches/{batch_id}/results")
+async def openai_batch_results(
+    batch_id: str,
+    api_key: Optional[str] = Query(None, description="Optional browser-supplied OpenAI API key; otherwise backend OPENAI_API_KEY is used."),
+):
+    key = (api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
+    if not key:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is required to fetch OpenAI batch results.")
+    batch = await _openai_get_batch(batch_id, key)
+    output_file_id = batch.get("output_file_id")
+    error_file_id = batch.get("error_file_id")
+    output = await _openai_get_file_text(output_file_id, key) if output_file_id else ""
+    errors = await _openai_get_file_text(error_file_id, key) if error_file_id else ""
+    return {"batch": batch, "output_jsonl": output, "error_jsonl": errors}
 
 
 @app.get("/api/health")
@@ -1724,7 +2030,7 @@ def _api_usage_guide_html() -> str:
         <tr>
           <td><code>thinking</code></td>
           <td><code>POST /api/chat</code> with local Ollama (ignored if cloud).</td>
-          <td>boolean, default <code>false</code></td>
+          <td>boolean, default <code>true</code></td>
           <td>
             <strong>Non-Gemma:</strong> passed to LangChain <code>ChatOllama</code> as Ollama <code>think</code> / <code>reasoning</code> on each call.<br/>
             <strong>Gemma 4:</strong> if <code>true</code>, <code>&lt;|think|&gt;</code> is added to the RAG system message and thought text is stripped from the stream;
@@ -1758,6 +2064,8 @@ def _api_usage_guide_html() -> str:
             <strong>stream</strong> — <code>true</code> → <code>text/plain</code> stream;
             <code>false</code> → JSON <code>message</code>, <code>model</code>, and if cloud <code>provider</code>.<br/>
             <strong>cloud</strong> — force cloud when model id is ambiguous.<br/>
+            <strong>rag_enabled</strong> — default <code>true</code>; set <code>false</code> to skip LangChain/Chroma retrieval for this request.<br/>
+            <strong>batch</strong> — OpenAI cloud only; set <code>true</code> to submit an asynchronous OpenAI Batch API job instead of a live response.<br/>
             <strong>thread_id</strong> — optional; server stores last messages per id (see GET thread).<br/>
             <strong>instruction</strong> — optional; prepended to last user message for this request only.<br/>
             <strong>structured_output</strong> + <strong>structured_tool</strong> — see <em>Structured output &amp; tools</em>.<br/>
@@ -1770,8 +2078,20 @@ def _api_usage_guide_html() -> str:
           <td>
             <strong>provider</strong> — <code>openai</code> | <code>anthropic</code> | <code>google</code>.<br/>
             <strong>model</strong>, <strong>messages</strong>, <strong>api_key</strong>.<br/>
-            <strong>reasoning</strong> — optional; OpenAI only (same semantics as <code>/api/chat</code>).
+            <strong>rag_enabled</strong> — default <code>true</code>; same shared Chroma RAG path as <code>/api/chat</code>.<br/>
+            <strong>reasoning</strong> — optional; OpenAI only (same semantics as <code>/api/chat</code>).<br/>
+            <strong>batch</strong> — OpenAI only; submit to OpenAI Batch API and return a JSON batch object.
           </td>
+        </tr>
+        <tr>
+          <td><code>GET /api/openai/batches/{{batch_id}}</code></td>
+          <td>Check OpenAI Batch API job status.</td>
+          <td>Path: <strong>batch_id</strong>. Optional query <code>api_key</code> for browser-key workflows; otherwise backend <code>OPENAI_API_KEY</code>.</td>
+        </tr>
+        <tr>
+          <td><code>GET /api/openai/batches/{{batch_id}}/results</code></td>
+          <td>Fetch completed OpenAI Batch output/error JSONL.</td>
+          <td>Path: <strong>batch_id</strong>. Optional query <code>api_key</code> for browser-key workflows.</td>
         </tr>
         <tr>
           <td><code>GET /api/chat/threads/{{thread_id}}</code></td>
@@ -1789,11 +2109,6 @@ def _api_usage_guide_html() -> str:
           <td><code>POST /api/rag/documents</code></td>
           <td>Add plain texts (chunked + embedded).</td>
           <td>Body: <code>{{ "texts": ["..."] }}</code></td>
-        </tr>
-        <tr>
-          <td><code>POST /api/rag/documents/files</code></td>
-          <td>Upload <code>.md</code> / <code>.txt</code> files (multipart).</td>
-          <td>Form field <code>files</code> — one or more files.</td>
         </tr>
         <tr>
           <td><code>GET /api/rag/status</code></td>
@@ -2098,15 +2413,20 @@ async def rag_add_documents(request: AddDocumentsRequest):
         splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         docs = []
         for t in request.texts:
-            if not (t and t.strip()):
+            if not (t and str(t).strip()):
                 continue
-            chunks = splitter.split_text(t.strip())
+            chunks = splitter.split_text(str(t).strip())
             for c in chunks:
-                docs.append(Document(page_content=c))
+                # Explicit empty metadata: Chroma expects dict-valued metadata per doc when provided via LangChain.
+                docs.append(Document(page_content=c, metadata={}))
         if not docs:
             return {"status": "ok", "added": 0, "message": "No non-empty content to add."}
         vs = _get_vector_store()
-        vs.add_documents(docs)
+        doc_ids = [str(uuid.uuid4()) for _ in docs]
+        for start in range(0, len(docs), _RAG_ADD_BATCH_SIZE):
+            batch = docs[start : start + _RAG_ADD_BATCH_SIZE]
+            ids_batch = doc_ids[start : start + _RAG_ADD_BATCH_SIZE]
+            vs.add_documents(batch, ids=ids_batch)
         return {"status": "ok", "added": len(docs), "message": f"Added {len(docs)} chunk(s) to the knowledge base."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2127,6 +2447,7 @@ async def rag_status():
             "embedding_model": RAG_EMBEDDING_MODEL,
             "collection": RAG_COLLECTION,
             "persist_directory": _DB_DIR,
+            "storage_size_bytes": _directory_size_bytes(_DB_DIR),
             "document_count": n,
         }
     except Exception as e:
@@ -2202,49 +2523,6 @@ async def rag_delete_storage():
         global _vector_store
         _vector_store = None
         return {"status": "ok", "message": "Vector storage cleared. All chunks have been deleted."}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-ALLOWED_EXTENSIONS = {".md", ".txt"}
-
-
-def _allowed_file(filename: str) -> bool:
-    if not filename:
-        return False
-    return any(filename.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
-
-
-@app.post("/api/rag/documents/files")
-async def rag_add_files(files: List[UploadFile] = File(...)):
-    """Add .md and .txt files to the knowledge base. Each file is split into chunks and embedded with source metadata."""
-    if not files:
-        raise HTTPException(status_code=400, detail="At least one file is required")
-    try:
-        _, Document, _, RecursiveCharacterTextSplitter = _rag_imports()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        docs = []
-        for f in files:
-            if not _allowed_file(f.filename or ""):
-                continue
-            content = (await f.read()).decode("utf-8", errors="replace")
-            if not (content and content.strip()):
-                continue
-            name = f.filename or "unknown"
-            chunks = splitter.split_text(content.strip())
-            for c in chunks:
-                docs.append(Document(page_content=c, metadata={"source": name}))
-        if not docs:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid .md or .txt content found. Upload only .md or .txt files with non-empty content.",
-            )
-        vs = _get_vector_store()
-        vs.add_documents(docs)
-        file_count = len(set(d.metadata.get("source") for d in docs))
-        return {"status": "ok", "added": len(docs), "files_processed": file_count, "message": f"Added {len(docs)} chunk(s) from {file_count} file(s)."}
     except HTTPException:
         raise
     except Exception as e:

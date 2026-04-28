@@ -93,6 +93,8 @@ def track_run(agent: str, *, action: str, metadata: Optional[dict] = None):
         "metrics": {},
         "events": [],
     }
+    with _lock:
+        _runs[agent].append(record)
     try:
         yield record
         record["status"] = record.get("status", "running")
@@ -105,8 +107,6 @@ def track_run(agent: str, *, action: str, metadata: Optional[dict] = None):
     finally:
         record["duration_s"] = round(time.perf_counter() - started, 3)
         record["ended_at"] = datetime.now().astimezone().isoformat()
-        with _lock:
-            _runs[agent].append(record)
         _append_jsonl(agent, record)
 
 

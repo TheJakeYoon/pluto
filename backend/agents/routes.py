@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from typing import List, Optional
@@ -16,6 +17,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from . import metrics
 from .config import (
     GENERATED_DIR,
+    INSERTION_COLLECTION,
     UPLOADS_DIR,
     allowed_insertion_extensions,
     education_agent_model,
@@ -27,6 +29,7 @@ from .education_agent import get_education_agent
 from .insertion_agent import get_insertion_agent
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+logger = logging.getLogger("uvicorn.error")
 
 _URL_INSERT_MAX_BYTES = 30 * 1024 * 1024
 _URL_INSERT_TIMEOUT = httpx.Timeout(20.0, read=60.0)
@@ -51,6 +54,7 @@ def _filename_from_url(url: str, content_type: str) -> str:
 
 
 async def _download_insertable_url(url: str) -> tuple[str, bytes, str]:
+    logger.info("Insertion URL download start url=%s", url)
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
             async with client.stream("GET", url, timeout=_URL_INSERT_TIMEOUT) as response:
@@ -63,17 +67,36 @@ async def _download_insertable_url(url: str) -> tuple[str, bytes, str]:
                         status_code=400,
                         detail=f"URL must point to a PDF or HTML page (got content-type {ctype or 'unknown'}).",
                     )
+                logger.info(
+                    "Insertion URL download response url=%s final_url=%s status=%d content_type=%s",
+                    url,
+                    str(response.url),
+                    response.status_code,
+                    ctype or "unknown",
+                )
                 chunks: list[bytes] = []
                 total = 0
+                next_log_bytes = 5 * 1024 * 1024
                 async for chunk in response.aiter_bytes():
                     total += len(chunk)
                     if total > _URL_INSERT_MAX_BYTES:
                         raise HTTPException(status_code=400, detail="URL download is too large (max 30 MB).")
+                    if total >= next_log_bytes:
+                        logger.info("Insertion URL download progress url=%s bytes=%d", url, total)
+                        next_log_bytes += 5 * 1024 * 1024
                     chunks.append(chunk)
                 data = b"".join(chunks)
                 if not data:
                     raise HTTPException(status_code=400, detail=f"URL returned an empty body: {url}")
-                return _filename_from_url(str(response.url), ctype), data, str(response.url)
+                filename = _filename_from_url(str(response.url), ctype)
+                logger.info(
+                    "Insertion URL download complete url=%s final_url=%s filename=%s bytes=%d",
+                    url,
+                    str(response.url),
+                    filename,
+                    len(data),
+                )
+                return filename, data, str(response.url)
         except HTTPException:
             raise
         except httpx.HTTPError as e:
@@ -90,6 +113,7 @@ async def agents_config():
         "insertion_agent_model": insertion_agent_model(),
         "education_agent_model": education_agent_model(),
         "embedding_model": embedding_model(),
+        "vector_collection": INSERTION_COLLECTION,
         "allowed_insertion_extensions": allowed_insertion_extensions(),
         "uploads_dir": UPLOADS_DIR,
         "generated_dir": GENERATED_DIR,
@@ -112,26 +136,39 @@ async def insertion_upload(files: List[UploadFile] = File(...)):
     agent = get_insertion_agent()
     results: List[dict] = []
     rejected: List[str] = []
+    logger.info("Insertion upload request start files=%d", len(files))
 
     for upload in files:
         name = upload.filename or ""
         if not is_allowed_filename(name):
             rejected.append(name)
+            logger.warning("Insertion upload rejected file=%s reason=unsupported_extension", name)
             continue
         data = await upload.read()
         if not data:
             rejected.append(name)
+            logger.warning("Insertion upload rejected file=%s reason=empty_file", name)
             continue
         try:
+            logger.info("Insertion upload file accepted file=%s bytes=%d", name, len(data))
             path = agent.persist_upload(name, data)
         except ValueError:
             rejected.append(name)
+            logger.warning("Insertion upload rejected file=%s reason=persist_validation", name)
             continue
 
         try:
             result = await asyncio.to_thread(agent.ingest_file, path)
             results.append(result)
+            logger.info(
+                "Insertion upload file complete file=%s stored_chunks=%s text_chars=%s loader=%s",
+                name,
+                result.get("stored_chunks"),
+                result.get("text_chars"),
+                result.get("loader"),
+            )
         except Exception as e:
+            logger.exception("Insertion upload file failed file=%s path=%s", name, path)
             results.append(
                 {"file": name, "path": path, "error": str(e), "stored_chunks": 0}
             )
@@ -146,6 +183,13 @@ async def insertion_upload(files: List[UploadFile] = File(...)):
             },
         )
 
+    logger.info(
+        "Insertion upload request complete processed=%d rejected=%d stored_chunks=%d text_chars=%d",
+        len(results),
+        len(rejected),
+        sum(int(r.get("stored_chunks") or 0) for r in results),
+        sum(int(r.get("text_chars") or 0) for r in results),
+    )
     return {
         "status": "ok",
         "processed": len(results),
@@ -164,6 +208,7 @@ async def insertion_url(req: InsertionUrlRequest):
     agent = get_insertion_agent()
     results: List[dict] = []
     rejected: List[str] = []
+    logger.info("Insertion URL request start urls=%d", len(req.urls))
 
     for raw_url in req.urls:
         url = str(raw_url)
@@ -172,14 +217,33 @@ async def insertion_url(req: InsertionUrlRequest):
             path = agent.persist_upload(filename, data)
             result = await asyncio.to_thread(agent.ingest_file, path, source_url=final_url)
             results.append(result)
+            logger.info(
+                "Insertion URL complete url=%s final_url=%s file=%s stored_chunks=%s text_chars=%s loader=%s",
+                url,
+                final_url,
+                filename,
+                result.get("stored_chunks"),
+                result.get("text_chars"),
+                result.get("loader"),
+            )
         except HTTPException as e:
             rejected.append(f"{url} — {e.detail}")
+            logger.warning("Insertion URL rejected url=%s detail=%s", url, e.detail)
         except Exception as e:
             rejected.append(f"{url} — {e}")
+            logger.exception("Insertion URL failed url=%s", url)
 
     if not results and rejected:
+        logger.warning("Insertion URL request rejected all URLs: %s", rejected)
         raise HTTPException(status_code=400, detail={"message": "No URLs could be inserted.", "rejected": rejected})
 
+    logger.info(
+        "Insertion URL request complete processed=%d rejected=%d stored_chunks=%d text_chars=%d",
+        len(results),
+        len(rejected),
+        sum(int(r.get("stored_chunks") or 0) for r in results),
+        sum(int(r.get("text_chars") or 0) for r in results),
+    )
     return {
         "status": "ok",
         "processed": len(results),

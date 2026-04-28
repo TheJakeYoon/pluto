@@ -5,10 +5,9 @@ Supported: pdf, txt, md, jpg, jpeg, png, heic, json, html/htm, doc, docx, xls, x
 Strategy:
 - Text-native formats (txt/md/json/html/csv) → decoded directly.
 - Office formats → python-docx / python-pptx / openpyxl.
-- PDF → PyMuPDF (fitz) for text. A helper also renders pages to PNG bytes so the
-  vision module can run a multimodal LLM over them (for scans / image-heavy PDFs).
-- Images → returned as PNG bytes + data URL for the vision module; caller should
-  run ``vision.vision_ocr_image`` to turn them into text.
+- PDF → rendered to page images with PyMuPDF, then OCR'd with pytesseract.
+  Native PDF text is kept as a fallback if OCR is unavailable or empty.
+- Images → normalized to PNG and OCR'd with pytesseract.
 """
 
 from __future__ import annotations
@@ -16,9 +15,32 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
+
+logger = logging.getLogger("uvicorn.error")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+PDF_OCR_MAX_PAGES = _env_int("PDF_OCR_MAX_PAGES", 250)  # <= 0 means all pages
+PDF_OCR_ZOOM = _env_float("PDF_OCR_ZOOM", 1.8)
+PDF_VISION_FALLBACK_MAX_PAGES = _env_int("PDF_VISION_FALLBACK_MAX_PAGES", 20)
 
 
 @dataclass
@@ -92,29 +114,176 @@ def extract_pdf_text(path: str) -> Tuple[str, dict]:
     return ("\n\n".join(parts).strip(), meta)
 
 
-def pdf_page_images(path: str, *, max_pages: int = 20, zoom: float = 1.8) -> List[bytes]:
+def pdf_page_images(path: str, *, max_pages: int = PDF_VISION_FALLBACK_MAX_PAGES, zoom: float = PDF_OCR_ZOOM) -> List[bytes]:
     """Render up to ``max_pages`` PDF pages as PNG bytes (for vision OCR)."""
     import fitz  # type: ignore
 
     out: List[bytes] = []
     with fitz.open(path) as doc:
-        pages = min(doc.page_count, max_pages)
+        pages = doc.page_count if max_pages <= 0 else min(doc.page_count, max_pages)
         matrix = fitz.Matrix(zoom, zoom)
         for i in range(pages):
+            page_start = time.perf_counter()
             pix = doc[i].get_pixmap(matrix=matrix, alpha=False)
             out.append(pix.tobytes("png"))
+            logger.info(
+                "Insertion PDF render page file=%s page=%d/%d image_bytes=%d elapsed_s=%.2f",
+                os.path.basename(path),
+                i + 1,
+                doc.page_count,
+                len(out[-1]),
+                time.perf_counter() - page_start,
+            )
     return out
 
 
-def _load_pdf(path: str) -> DocumentLoadResult:
-    text, meta = extract_pdf_text(path)
-    needs_vision = len(text.strip()) < 40  # heuristic: scanned / image-only PDF
-    result = DocumentLoadResult(text=text, metadata=meta, needs_vision=needs_vision)
-    if needs_vision:
+def _tesseract_ocr_png(png_bytes: bytes) -> str:
+    """OCR PNG bytes with pytesseract.
+
+    ``pytesseract`` is a Python wrapper around the native ``tesseract`` binary,
+    so callers catch failures and can surface a useful warning to the UI.
+    """
+    from PIL import Image  # type: ignore
+    import pytesseract  # type: ignore
+
+    with Image.open(io.BytesIO(png_bytes)) as img:
+        img = img.convert("RGB")
+        return (pytesseract.image_to_string(img) or "").strip()
+
+
+def _tesseract_ocr_pdf_pages(pages_png: List[bytes]) -> str:
+    parts: List[str] = []
+    for i, png in enumerate(pages_png, start=1):
+        text = _tesseract_ocr_png(png)
+        if text.strip():
+            parts.append(f"[Page {i}]\n{text.strip()}")
+    return "\n\n".join(parts).strip()
+
+
+def _ensure_tesseract_available() -> str:
+    import pytesseract  # type: ignore
+
+    return str(pytesseract.get_tesseract_version())
+
+
+def _tesseract_ocr_pdf_file(
+    path: str,
+    *,
+    max_pages: int,
+    zoom: float,
+    progress_callback: Optional[Callable[[dict], None]] = None,
+) -> tuple[str, int, int]:
+    import fitz  # type: ignore
+
+    parts: List[str] = []
+    total_chars = 0
+    with fitz.open(path) as doc:
+        total_pages = doc.page_count
+        pages_to_process = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+        matrix = fitz.Matrix(zoom, zoom)
+        logger.info(
+            "Insertion PDF OCR start file=%s pages_total=%d pages_to_process=%d max_pages=%d zoom=%.2f",
+            os.path.basename(path),
+            total_pages,
+            pages_to_process,
+            max_pages,
+            zoom,
+        )
+        if pages_to_process < total_pages:
+            logger.warning(
+                "Insertion PDF OCR truncated file=%s pages_total=%d pages_processed=%d set PDF_OCR_MAX_PAGES=0 to process all pages",
+                os.path.basename(path),
+                total_pages,
+                pages_to_process,
+            )
+        for i in range(pages_to_process):
+            page_start = time.perf_counter()
+            pix = doc[i].get_pixmap(matrix=matrix, alpha=False)
+            png = pix.tobytes("png")
+            text = _tesseract_ocr_png(png)
+            page_text = text.strip()
+            page_chars = len(page_text)
+            total_chars += page_chars
+            logger.info(
+                "Insertion PDF OCR page file=%s page=%d/%d chars=%d cumulative_chars=%d image_bytes=%d elapsed_s=%.2f",
+                os.path.basename(path),
+                i + 1,
+                total_pages,
+                page_chars,
+                total_chars,
+                len(png),
+                time.perf_counter() - page_start,
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "pdf_ocr_page",
+                        "page": i + 1,
+                        "page_count": total_pages,
+                        "pages_inserted": i + 1,
+                        "chars": page_chars,
+                        "cumulative_chars": total_chars,
+                    }
+                )
+            if page_text:
+                parts.append(f"[Page {i + 1}]\n{page_text}")
+    return "\n\n".join(parts).strip(), pages_to_process, total_chars
+
+
+def _load_pdf(path: str, *, progress_callback: Optional[Callable[[dict], None]] = None) -> DocumentLoadResult:
+    file_name = os.path.basename(path)
+    load_start = time.perf_counter()
+    native_text, meta = extract_pdf_text(path)
+    meta = dict(meta)
+    meta["loader"] = "pdf-tesseract"
+    result = DocumentLoadResult(text="", metadata=meta)
+
+    try:
+        version = _ensure_tesseract_available()
+        logger.info("Insertion PDF OCR tesseract version=%s file=%s", version, file_name)
+        text, processed_pages, ocr_chars = _tesseract_ocr_pdf_file(
+            path,
+            max_pages=PDF_OCR_MAX_PAGES,
+            zoom=PDF_OCR_ZOOM,
+            progress_callback=progress_callback,
+        )
+        result.text = text
+        result.metadata["ocr_pages_processed"] = processed_pages
+        result.metadata["ocr_chars"] = ocr_chars
+    except Exception as e:
+        result.warnings.append(
+            f"pytesseract PDF OCR failed: {e}. Install the native tesseract binary (macOS: brew install tesseract)."
+        )
+        logger.warning("Insertion PDF OCR failed file=%s error=%s", file_name, e)
+
+    if not result.text.strip() and native_text.strip():
+        result.text = native_text
+        result.metadata["loader"] = "pdf-text-fallback"
+        result.warnings.append("Used native PDF text because pytesseract returned no text.")
+        logger.info(
+            "Insertion PDF native text fallback file=%s chars=%d",
+            file_name,
+            len(native_text),
+        )
+
+    if not result.text.strip():
+        # Last-resort compatibility with the existing vision LLM path.
         try:
             result.page_images = pdf_page_images(path)
+            result.needs_vision = bool(result.page_images)
         except Exception as e:
-            result.warnings.append(f"Could not render PDF pages for vision: {e}")
+            result.warnings.append(f"Could not render PDF pages for vision fallback: {e}")
+            logger.warning("Insertion PDF vision fallback render failed file=%s error=%s", file_name, e)
+    logger.info(
+        "Insertion PDF load complete file=%s loader=%s chars=%d pages_total=%s ocr_pages=%s needs_vision=%s elapsed_s=%.2f",
+        file_name,
+        result.metadata.get("loader"),
+        len(result.text),
+        result.metadata.get("page_count"),
+        result.metadata.get("ocr_pages_processed", 0),
+        result.needs_vision,
+        time.perf_counter() - load_start,
+    )
     return result
 
 
@@ -192,10 +361,11 @@ def _load_pptx(path: str) -> DocumentLoadResult:
 
 
 def _load_image(path: str) -> DocumentLoadResult:
-    """Load image as PNG bytes and defer text extraction to the vision helper."""
+    """Load image as PNG bytes and OCR it with pytesseract."""
     from PIL import Image  # type: ignore
 
     ext = os.path.splitext(path)[1].lower()
+    warnings: List[str] = []
     if ext == ".heic":
         try:
             import pillow_heif  # type: ignore
@@ -208,11 +378,32 @@ def _load_image(path: str) -> DocumentLoadResult:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         png_bytes = buf.getvalue()
+
+    text = ""
+    needs_vision = False
+    try:
+        text = _tesseract_ocr_png(png_bytes)
+        logger.info(
+            "Insertion image OCR complete file=%s chars=%d image_bytes=%d",
+            os.path.basename(path),
+            len(text),
+            len(png_bytes),
+        )
+    except Exception as e:
+        needs_vision = True
+        warnings.append(
+            f"pytesseract image OCR failed: {e}. Install the native tesseract binary (macOS: brew install tesseract)."
+        )
+        logger.warning("Insertion image OCR failed file=%s error=%s", os.path.basename(path), e)
+    if not text.strip():
+        needs_vision = True
+        warnings.append("pytesseract returned no text for image; falling back to vision OCR.")
     return DocumentLoadResult(
-        text="",
+        text=text,
         images=[png_bytes],
-        metadata={"loader": "image", "format": ext.lstrip(".")},
-        needs_vision=True,
+        metadata={"loader": "image-tesseract", "format": ext.lstrip(".")},
+        needs_vision=needs_vision,
+        warnings=warnings,
     )
 
 
@@ -238,7 +429,7 @@ _EXT_LOADERS = {
 }
 
 
-def load_file_to_text(path: str) -> DocumentLoadResult:
+def load_file_to_text(path: str, progress_callback: Optional[Callable[[dict], None]] = None) -> DocumentLoadResult:
     """Dispatch to the correct loader based on the file extension."""
     ext = os.path.splitext(path)[1].lower()
     if ext not in _EXT_LOADERS:
@@ -246,6 +437,8 @@ def load_file_to_text(path: str) -> DocumentLoadResult:
             f"Unsupported file type: {ext or '(none)'}. Supported: {', '.join(sorted(_EXT_LOADERS))}"
         )
     try:
+        if ext == ".pdf":
+            return _load_pdf(path, progress_callback=progress_callback)
         return _EXT_LOADERS[ext](path)
     except ImportError as e:
         raise RuntimeError(

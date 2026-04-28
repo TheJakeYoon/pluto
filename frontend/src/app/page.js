@@ -117,6 +117,50 @@ function MarkdownText({ text }) {
   );
 }
 
+function apiErrorMessage(data, fallback = 'Request failed') {
+  const detail = data?.detail ?? data?.error ?? data?.message;
+  if (!detail) return fallback;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) return detail.map((item) => apiErrorMessage({ detail: item }, fallback)).join('; ');
+  if (typeof detail === 'object') {
+    const message = typeof detail.message === 'string' ? detail.message : fallback;
+    const rejected = Array.isArray(detail.rejected) && detail.rejected.length
+      ? ` Rejected: ${detail.rejected.join('; ')}`
+      : '';
+    return `${message}${rejected}`;
+  }
+  return String(detail);
+}
+
+function formatStorageSize(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const decimals = unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(decimals)} ${units[unitIndex]}`;
+}
+
+function insertionPageSummary(results) {
+  const withPages = (results || []).filter((r) => typeof r.pages_inserted === 'number' || typeof r.page_count === 'number');
+  if (!withPages.length) return '';
+  const inserted = withPages.reduce((acc, r) => acc + (r.pages_inserted || 0), 0);
+  const total = withPages.reduce((acc, r) => acc + (r.page_count || r.pages_inserted || 0), 0);
+  return total ? `; pages ${inserted.toLocaleString()} / ${total.toLocaleString()}` : '';
+}
+
+function insertionPagesComplete(progress) {
+  return Boolean(progress?.pageCount && progress?.pagesInserted >= progress.pageCount);
+}
+
+function insertionBusyLabel(progress, activeLabel) {
+  return insertionPagesComplete(progress) ? 'Finalizing…' : activeLabel;
+}
+
 function MessageContent({ content }) {
   return (
     <>
@@ -143,6 +187,41 @@ function MessageContent({ content }) {
         );
       })}
     </>
+  );
+}
+
+function ActiveRequestStatus({ provider, ragEnabled, ollamaThinking, openaiReasoning }) {
+  const reasoningText = provider === 'ollama'
+    ? (ollamaThinking ? 'Thinking enabled' : 'Thinking off')
+    : provider === 'openai'
+      ? (openaiReasoning !== 'none' ? `Reasoning ${openaiReasoning}` : 'Reasoning off')
+      : 'Reasoning not available';
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '0.45rem',
+        color: 'var(--text-secondary)',
+        fontSize: '0.82rem',
+      }}
+    >
+      <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
+        <div className="typing-dot"></div>
+        <div className="typing-dot"></div>
+        <div className="typing-dot"></div>
+        <span>Working…</span>
+      </div>
+      <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+        <span style={{ padding: '0.2rem 0.45rem', borderRadius: '999px', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }}>
+          {ragEnabled ? 'Embedding query + retrieving RAG context' : 'RAG disabled'}
+        </span>
+        <span style={{ padding: '0.2rem 0.45rem', borderRadius: '999px', border: '1px solid var(--border)', background: 'var(--bg-secondary)' }}>
+          {reasoningText}
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -236,10 +315,14 @@ export default function Home() {
   const [models, setModels] = useState([]);
   const [loadedModels, setLoadedModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState('gpt-oss:20b');
-  /** Ollama: opt-in reasoning. Gemma 4 thought text is hidden, so default off keeps chat visibly streaming. */
-  const [ollamaThinking, setOllamaThinking] = useState(false);
+  /** Ollama: reasoning / thinking; on by default (Gemma 4 may hide thought text before the answer streams). */
+  const [ollamaThinking, setOllamaThinking] = useState(true);
+  /** Shared ChromaDB RAG context; on by default for every provider. */
+  const [ragEnabled, setRagEnabled] = useState(true);
   /** OpenAI reasoning models: maps to LangChain ChatOpenAI reasoning_effort (none = omit). */
   const [openaiReasoning, setOpenaiReasoning] = useState('none');
+  /** OpenAI Batch API: async generation with lower cost / 24h completion window. */
+  const [openaiBatch, setOpenaiBatch] = useState(false);
   const [manageModel, setManageModel] = useState('gpt-oss:20b');
   const [isManageModalOpen, setIsManageModalOpen] = useState(false);
 
@@ -252,11 +335,9 @@ export default function Home() {
     google: 'gemini-2.5-flash',
   });
   const [showApiKey, setShowApiKey] = useState({ openai: false, anthropic: false, google: false });
-  const [settingsTab, setSettingsTab] = useState('local'); // 'local' | 'cloud' | 'rag' | 'embeddings' | 'agents'
+  const [settingsTab, setSettingsTab] = useState('local'); // 'local' | 'cloud' | 'rag' | 'agents'
   const [ragStatus, setRagStatus] = useState(null);
   const [ragError, setRagError] = useState(null);
-  const [ragText, setRagText] = useState('');
-  const [ragAdding, setRagAdding] = useState(false);
 
   // Embeddings / vector storage tab
   const [embeddingsChunks, setEmbeddingsChunks] = useState([]);
@@ -266,14 +347,12 @@ export default function Home() {
   const [embeddingsError, setEmbeddingsError] = useState(null);
   const [chunksLoading, setChunksLoading] = useState(false);
   const [embeddingsActionLoading, setEmbeddingsActionLoading] = useState(false);
-  const [fileUploadProgress, setFileUploadProgress] = useState(null);
-  const fileInputRef = useRef(null);
-  const directoryInputRef = useRef(null);
 
   // Insertion + education agents
   const [agentsConfig, setAgentsConfig] = useState(null);
   const [isInsertModalOpen, setIsInsertModalOpen] = useState(false);
   const [insertProgress, setInsertProgress] = useState(null);
+  const [insertLiveProgress, setInsertLiveProgress] = useState(null);
   const [insertResults, setInsertResults] = useState([]);
   const [insertLoading, setInsertLoading] = useState(false);
   const [insertRejected, setInsertRejected] = useState([]);
@@ -344,7 +423,7 @@ export default function Home() {
   };
 
   useEffect(() => {
-    if (isManageModalOpen && (settingsTab === 'rag' || settingsTab === 'embeddings')) {
+    if (isManageModalOpen && settingsTab === 'rag') {
       setRagError(null);
       setEmbeddingsError(null);
       fetch('http://localhost:8000/api/rag/status')
@@ -357,7 +436,7 @@ export default function Home() {
   }, [isManageModalOpen, settingsTab]);
 
   useEffect(() => {
-    if (isManageModalOpen && settingsTab === 'embeddings') {
+    if (isManageModalOpen && settingsTab === 'rag') {
       setChunksLoading(true);
       setEmbeddingsError(null);
       fetch('http://localhost:8000/api/rag/chunks?limit=500&offset=0')
@@ -388,6 +467,45 @@ export default function Home() {
       .then(data => setAgentStats(data))
       .catch(() => setAgentStats(null));
   }, [agentFilter]);
+
+  useEffect(() => {
+    if (!insertLoading) {
+      return undefined;
+    }
+    let cancelled = false;
+    const pollInsertionProgress = async () => {
+      try {
+        const r = await fetch('http://localhost:8000/api/agents/runs?agent=insertion&limit=10');
+        if (!r.ok) return;
+        const data = await r.json();
+        if (cancelled) return;
+        const running = (data.runs || []).find((run) => run.status === 'running');
+        if (!running) return;
+        const metrics = running.metrics || {};
+        const events = running.events || [];
+        const latestPage = [...events].reverse().find((event) => event.event === 'pdf_ocr_page');
+        const pagesInserted = metrics.pages_inserted || latestPage?.pages_inserted || latestPage?.page;
+        const pageCount = metrics.page_count || latestPage?.page_count;
+        const chars = metrics.ocr_chars || latestPage?.cumulative_chars;
+        if (pagesInserted && pageCount) {
+          setInsertLiveProgress({
+            pagesInserted,
+            pageCount,
+            chars,
+            file: running.metadata?.filename || 'document',
+          });
+        }
+      } catch {
+        // Progress polling is best-effort; final responses still show totals.
+      }
+    };
+    pollInsertionProgress();
+    const id = setInterval(pollInsertionProgress, 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [insertLoading]);
 
   useEffect(() => { loadAgentsConfig(); }, [loadAgentsConfig]);
 
@@ -522,6 +640,7 @@ export default function Home() {
             thread_id: threadId,
             stream: true,
             thinking: ollamaThinking,
+            rag_enabled: ragEnabled,
           }),
         });
       } else if (provider === 'openai' || provider === 'anthropic') {
@@ -535,6 +654,8 @@ export default function Home() {
             messages: newMessages,
             thread_id: threadId,
             stream: true,
+            rag_enabled: ragEnabled,
+            batch: provider === 'openai' ? openaiBatch : false,
             ...(provider === 'openai'
               ? { reasoning: openaiReasoning }
               : {}),
@@ -550,6 +671,8 @@ export default function Home() {
             model: cloudModels[provider],
             messages: newMessages,
             api_key: apiKeys[provider],
+            rag_enabled: ragEnabled,
+            batch: provider === 'openai' ? openaiBatch : false,
             ...(provider === 'openai' ? { reasoning: openaiReasoning } : {}),
           }),
         });
@@ -661,7 +784,12 @@ export default function Home() {
       return;
     }
     setInsertLoading(true);
+    setInsertLiveProgress(null);
     setInsertProgress(`Uploading ${accepted.length} file(s)…`);
+    console.info('[insertion] upload start', {
+      accepted: accepted.map((f) => ({ name: f.name, size: f.size, type: f.type })),
+      rejected,
+    });
     try {
       const form = new FormData();
       for (const f of accepted) form.append('files', f);
@@ -670,12 +798,21 @@ export default function Home() {
         body: form,
       });
       const data = await r.json();
-      if (!r.ok) throw new Error(data?.detail?.message || data?.detail || r.statusText);
+      if (!r.ok) throw new Error(apiErrorMessage(data, r.statusText));
       setInsertResults(data.results || []);
       setInsertRejected(prev => Array.from(new Set([...(prev || []), ...(data.rejected || [])])));
       const stored = (data.results || []).reduce((acc, x) => acc + (x.stored_chunks || 0), 0);
-      setInsertProgress(`Processed ${data.processed || 0} file(s); stored ${stored} chunk(s).`);
+      const textChars = (data.results || []).reduce((acc, x) => acc + (x.text_chars || 0), 0);
+      console.info('[insertion] upload complete', {
+        processed: data.processed || 0,
+        rejected: data.rejected || [],
+        storedChunks: stored,
+        textChars,
+        results: data.results || [],
+      });
+      setInsertProgress(`Processed ${data.processed || 0} file(s); stored ${stored} chunk(s); inserted ${textChars.toLocaleString()} text chars${insertionPageSummary(data.results || [])}.`);
     } catch (err) {
+      console.error('[insertion] upload failed', err);
       setInsertProgress(`Error: ${err.message || err}`);
     } finally {
       setInsertLoading(false);
@@ -693,8 +830,10 @@ export default function Home() {
       return;
     }
     setInsertLoading(true);
+    setInsertLiveProgress(null);
     setInsertProgress(`Fetching ${urls.length} link(s)…`);
     setInsertRejected([]);
+    console.info('[insertion] url start', { urls });
     try {
       const r = await fetch('http://localhost:8000/api/agents/insertion/url', {
         method: 'POST',
@@ -702,12 +841,21 @@ export default function Home() {
         body: JSON.stringify({ urls }),
       });
       const data = await r.json();
-      if (!r.ok) throw new Error(data?.detail?.message || data?.detail || r.statusText);
+      if (!r.ok) throw new Error(apiErrorMessage(data, r.statusText));
       setInsertResults(data.results || []);
       setInsertRejected(data.rejected || []);
       const stored = (data.results || []).reduce((acc, x) => acc + (x.stored_chunks || 0), 0);
-      setInsertProgress(`Inserted ${data.processed || 0} link(s); stored ${stored} chunk(s).`);
+      const textChars = (data.results || []).reduce((acc, x) => acc + (x.text_chars || 0), 0);
+      console.info('[insertion] url complete', {
+        processed: data.processed || 0,
+        rejected: data.rejected || [],
+        storedChunks: stored,
+        textChars,
+        results: data.results || [],
+      });
+      setInsertProgress(`Inserted ${data.processed || 0} link(s); stored ${stored} chunk(s); inserted ${textChars.toLocaleString()} text chars${insertionPageSummary(data.results || [])}.`);
     } catch (err) {
+      console.error('[insertion] url failed', err);
       setInsertProgress(`Error: ${err.message || err}`);
     } finally {
       setInsertLoading(false);
@@ -715,7 +863,7 @@ export default function Home() {
   };
 
   const openInsertedDataView = () => {
-    setSettingsTab('embeddings');
+    setSettingsTab('rag');
     setIsManageModalOpen(true);
     setEmbeddingsError(null);
     setChunksLoading(true);
@@ -919,26 +1067,77 @@ export default function Home() {
               )}
             </Stack>
           </div>
-          {provider === 'ollama' && (
-            <div style={{ display: 'flex', justifyContent: 'center', marginTop: '0.35rem' }}>
+          {(provider === 'ollama' || provider === 'openai' || provider === 'anthropic' || provider === 'google') && (
+            <div style={{ display: 'flex', justifyContent: 'center', gap: '0.85rem', alignItems: 'center', flexWrap: 'wrap', marginTop: '0.35rem' }}>
               <FormControlLabel
                 control={
                   <Checkbox
                     size="small"
-                    checked={ollamaThinking}
-                    onChange={(e) => setOllamaThinking(e.target.checked)}
+                    checked={ragEnabled}
+                    onChange={(e) => setRagEnabled(e.target.checked)}
                     sx={{ color: 'var(--text-secondary)' }}
-                />
+                  />
                 }
-                label="Thinking / reasoning (off by default; Gemma 4 hides thought text before streaming the answer)"
+                label="RAG context"
                 sx={{
                   color: 'var(--text-secondary)',
                   '& .MuiFormControlLabel-label': { fontSize: '0.78rem' },
                 }}
               />
+              {provider === 'ollama' && (
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      size="small"
+                      checked={ollamaThinking}
+                      onChange={(e) => setOllamaThinking(e.target.checked)}
+                      sx={{ color: 'var(--text-secondary)' }}
+                    />
+                  }
+                  label="Thinking / reasoning"
+                  sx={{
+                    color: 'var(--text-secondary)',
+                    '& .MuiFormControlLabel-label': { fontSize: '0.78rem' },
+                  }}
+                />
+              )}
+              {provider === 'openai' && (
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      size="small"
+                      checked={openaiReasoning !== 'none'}
+                      onChange={(e) => setOpenaiReasoning(e.target.checked ? 'medium' : 'none')}
+                      sx={{ color: 'var(--text-secondary)' }}
+                    />
+                  }
+                  label="Reasoning"
+                  sx={{
+                    color: 'var(--text-secondary)',
+                    '& .MuiFormControlLabel-label': { fontSize: '0.78rem' },
+                  }}
+                />
+              )}
+              {provider === 'openai' && (
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      size="small"
+                      checked={openaiBatch}
+                      onChange={(e) => setOpenaiBatch(e.target.checked)}
+                      sx={{ color: 'var(--text-secondary)' }}
+                    />
+                  }
+                  label="Batch"
+                  sx={{
+                    color: 'var(--text-secondary)',
+                    '& .MuiFormControlLabel-label': { fontSize: '0.78rem' },
+                  }}
+                />
+              )}
             </div>
           )}
-          {provider === 'openai' && (
+          {provider === 'openai' && openaiReasoning !== 'none' && (
             <Stack direction="row" justifyContent="center" alignItems="center" sx={{ mt: 0.5 }}>
               <FormControl size="small" sx={{ ...muiFieldSx, minWidth: 160 }}>
                 <InputLabel id="openai-reasoning-label">Reasoning effort</InputLabel>
@@ -992,16 +1191,30 @@ export default function Home() {
           {messages.map((msg, index) => (
             <div key={index} className={`message-wrapper ${msg.role === 'user' ? 'user' : 'bot'}`}>
               <div className="message-bubble">
-                <MessageContent content={msg.content} />
+                {isLoading && index === messages.length - 1 && msg.role === 'assistant' && !msg.content ? (
+                  <ActiveRequestStatus
+                    provider={provider}
+                    ragEnabled={ragEnabled}
+                    ollamaThinking={ollamaThinking}
+                    openaiReasoning={openaiReasoning}
+                  />
+                ) : (
+                  <MessageContent content={msg.content} />
+                )}
               </div>
             </div>
           ))}
 
           {isLoading && messages.length > 0 && messages[messages.length - 1].role !== 'assistant' && (
-            <div className="typing-indicator">
-              <div className="typing-dot"></div>
-              <div className="typing-dot"></div>
-              <div className="typing-dot"></div>
+            <div className="message-wrapper bot">
+              <div className="message-bubble">
+                <ActiveRequestStatus
+                  provider={provider}
+                  ragEnabled={ragEnabled}
+                  ollamaThinking={ollamaThinking}
+                  openaiReasoning={openaiReasoning}
+                />
+              </div>
             </div>
           )}
 
@@ -1114,7 +1327,6 @@ export default function Home() {
               <Tab value="local" label="Local Models" />
               <Tab value="cloud" label="Cloud API Keys" />
               <Tab value="rag" label="Knowledge base" />
-              <Tab value="embeddings" label="Embeddings & storage" />
               <Tab value="agents" label="Agents" />
             </Tabs>
 
@@ -1233,7 +1445,7 @@ export default function Home() {
             {settingsTab === 'rag' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                 <p className="settings-helper-text">
-                  Add text to the knowledge base. When you chat with Ollama, the app retrieves relevant chunks and uses them as context (2-step RAG). Use an embedding model already loaded in Ollama (e.g. embeddinggemma:latest) — see Local Models.
+                  Browse inserted files/URLs and manage the shared ChromaDB collection used by chat RAG and the insertion agent.
                 </p>
                 {ragError && (
                   <div className="api-key-section" style={{ borderColor: 'rgba(239, 68, 68, 0.5)', background: 'rgba(239, 68, 68, 0.08)' }}>
@@ -1243,60 +1455,18 @@ export default function Home() {
                 {ragStatus && (
                   <div className="api-key-section">
                     <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                      Embedding: {ragStatus.embedding_model} · Chunks: {ragStatus.document_count ?? '—'}
+                      Embedding: {ragStatus.embedding_model} · Collection: {ragStatus.collection || agentsConfig?.vector_collection || '—'} · Chunks: {embeddingsChunkCount ?? ragStatus.document_count ?? '—'} · Storage: {formatStorageSize(ragStatus.storage_size_bytes)}
                     </span>
                   </div>
                 )}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <label style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Add document text</label>
-                  <textarea
-                    className="api-key-input"
-                    value={ragText}
-                    onChange={e => setRagText(e.target.value)}
-                    placeholder="Paste text or a paragraph to add to the knowledge base..."
-                    rows={4}
-                    style={{ resize: 'vertical', minHeight: '80px' }}
-                  />
-                  <button
-                    onClick={async () => {
-                      if (!ragText.trim()) return;
-                      setRagAdding(true);
-                      try {
-                        const r = await fetch('http://localhost:8000/api/rag/documents', {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({ texts: [ragText.trim()] }),
-                        });
-                        const data = await r.json();
-                        if (!r.ok) throw new Error(data.detail || 'Failed to add');
-                        setRagText('');
-                        if (ragStatus != null) setRagStatus(prev => prev ? { ...prev, document_count: (prev.document_count ?? 0) + data.added } : null);
-                        else fetch('http://localhost:8000/api/rag/status').then(res => res.json()).then(setRagStatus);
-                      } catch (err) {
-                        alert(err.message || 'Failed to add to knowledge base');
-                      } finally {
-                        setRagAdding(false);
-                      }
-                    }}
-                    disabled={!ragText.trim() || ragAdding}
-                    style={{
-                      padding: '0.5rem 1rem', borderRadius: '8px', fontWeight: '600',
-                      background: ragText.trim() && !ragAdding ? 'var(--accent-color)' : 'var(--bg-secondary)',
-                      color: ragText.trim() && !ragAdding ? 'white' : 'var(--text-secondary)',
-                      border: '1px solid var(--border)', cursor: ragText.trim() && !ragAdding ? 'pointer' : 'not-allowed',
-                    }}
-                  >
-                    {ragAdding ? 'Adding…' : 'Add to knowledge base'}
-                  </button>
-                </div>
               </div>
             )}
 
-            {/* Embeddings & vector storage Tab */}
-            {settingsTab === 'embeddings' && (
+            {/* Shared knowledge base storage */}
+            {settingsTab === 'rag' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                 <p className="settings-helper-text">
-                  Manage vector storage and embeddings: clear all data, browse/delete chunks, or add .md / .txt files (single, multiple, or entire folder).
+                  These chunks come from plain-text knowledge base entries, uploaded files, and inserted web links. Chat RAG retrieves from this same collection.
                 </p>
                 {embeddingsError && (
                   <div className="api-key-section" style={{ borderColor: 'rgba(239, 68, 68, 0.5)', background: 'rgba(239, 68, 68, 0.08)' }}>
@@ -1306,7 +1476,7 @@ export default function Home() {
                 {ragStatus && (
                   <div className="api-key-section">
                     <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                      Embedding: {ragStatus.embedding_model} · Total chunks: {embeddingsChunkCount ?? ragStatus.document_count ?? '—'}
+                      Embedding: {ragStatus.embedding_model} · Total chunks: {embeddingsChunkCount ?? ragStatus.document_count ?? '—'} · Storage: {formatStorageSize(ragStatus.storage_size_bytes)}
                     </span>
                   </div>
                 )}
@@ -1453,107 +1623,6 @@ export default function Home() {
                     </>
                   )}
                 </div>
-
-                {/* Add from files or directory */}
-                <div className="api-key-section">
-                  <label style={{ fontSize: '0.9rem', fontWeight: '600', color: 'var(--text-primary)' }}>Add .md / .txt files</label>
-                  <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', margin: '0.4rem 0 0.6rem 0' }}>
-                    Upload one or more files, or select a folder to add all .md and .txt files inside it.
-                  </p>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept=".md,.txt"
-                    multiple
-                    style={{ display: 'none' }}
-                    onChange={async (e) => {
-                      const files = e.target.files;
-                      if (!files?.length) return;
-                      setFileUploadProgress('Uploading…');
-                      setEmbeddingsActionLoading(true);
-                      try {
-                        const form = new FormData();
-                        for (let i = 0; i < files.length; i++) form.append('files', files[i]);
-                        const r = await fetch('http://localhost:8000/api/rag/documents/files', { method: 'POST', body: form });
-                        const data = await r.json();
-                        if (!r.ok) throw new Error(data.detail || 'Upload failed');
-                        setFileUploadProgress(`Added ${data.added} chunk(s) from ${data.files_processed} file(s).`);
-                        setEmbeddingsChunkCount(prev => (prev != null ? prev + data.added : data.added));
-                        if (ragStatus) setRagStatus(prev => prev ? { ...prev, document_count: (prev.document_count ?? 0) + data.added } : null);
-                        fetch('http://localhost:8000/api/rag/chunks?limit=500&offset=0').then(res => res.json()).then(d => setEmbeddingsChunks(d.chunks || []));
-                      } catch (err) {
-                        alert(err.message || 'Upload failed');
-                      } finally {
-                        setEmbeddingsActionLoading(false);
-                        e.target.value = '';
-                        if (fileInputRef.current) fileInputRef.current.value = '';
-                      }
-                    }}
-                  />
-                  <input
-                    ref={directoryInputRef}
-                    type="file"
-                    webkitDirectory
-                    multiple
-                    style={{ display: 'none' }}
-                    onChange={async (e) => {
-                      const files = e.target.files;
-                      if (!files?.length) return;
-                      const allowed = Array.from(files).filter(f => /\.(md|txt)$/i.test(f.name));
-                      if (allowed.length === 0) {
-                        alert('No .md or .txt files found in the selected folder.');
-                        e.target.value = '';
-                        return;
-                      }
-                      setFileUploadProgress(`Adding ${allowed.length} file(s)…`);
-                      setEmbeddingsActionLoading(true);
-                      try {
-                        const form = new FormData();
-                        allowed.forEach(f => form.append('files', f));
-                        const r = await fetch('http://localhost:8000/api/rag/documents/files', { method: 'POST', body: form });
-                        const data = await r.json();
-                        if (!r.ok) throw new Error(data.detail || 'Upload failed');
-                        setFileUploadProgress(`Added ${data.added} chunk(s) from ${data.files_processed} file(s).`);
-                        setEmbeddingsChunkCount(prev => (prev != null ? prev + data.added : data.added));
-                        if (ragStatus) setRagStatus(prev => prev ? { ...prev, document_count: (prev.document_count ?? 0) + data.added } : null);
-                        fetch('http://localhost:8000/api/rag/chunks?limit=500&offset=0').then(res => res.json()).then(d => setEmbeddingsChunks(d.chunks || []));
-                      } catch (err) {
-                        alert(err.message || 'Upload failed');
-                      } finally {
-                        setEmbeddingsActionLoading(false);
-                        e.target.value = '';
-                        if (directoryInputRef.current) directoryInputRef.current.value = '';
-                      }
-                    }}
-                  />
-                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      disabled={embeddingsActionLoading}
-                      style={{
-                        padding: '0.5rem 1rem', borderRadius: '8px', fontWeight: '600',
-                        background: 'var(--accent-color)', color: 'white', border: 'none', cursor: embeddingsActionLoading ? 'not-allowed' : 'pointer',
-                      }}
-                    >
-                      Choose files…
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => directoryInputRef.current?.click()}
-                      disabled={embeddingsActionLoading}
-                      style={{
-                        padding: '0.5rem 1rem', borderRadius: '8px', fontWeight: '600',
-                        background: 'var(--bg-secondary)', color: 'var(--text-primary)', border: '1px solid var(--border)', cursor: embeddingsActionLoading ? 'not-allowed' : 'pointer',
-                      }}
-                    >
-                      Choose folder…
-                    </button>
-                  </div>
-                  {fileUploadProgress && (
-                    <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>{fileUploadProgress}</div>
-                  )}
-                </div>
               </div>
             )}
 
@@ -1680,50 +1749,77 @@ export default function Home() {
 
       {/* Insertion Modal */}
       {isInsertModalOpen && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(4px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999 }}>
-          <div style={{ backgroundColor: '#161b22', padding: '2rem', borderRadius: '12px', minWidth: '460px', maxWidth: '560px', border: '1px solid var(--chat-border)', boxShadow: '0 10px 25px rgba(0,0,0,0.8)', color: 'var(--text-primary)', maxHeight: '80vh', overflowY: 'auto' }}>
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(2, 6, 23, 0.78)', backdropFilter: 'blur(6px)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 9999 }}>
+          <div style={{ backgroundColor: '#0f172a', padding: '2rem', borderRadius: '14px', minWidth: '480px', maxWidth: '600px', border: '1px solid rgba(96, 165, 250, 0.45)', boxShadow: '0 24px 80px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,255,255,0.04)', color: '#f8fafc', maxHeight: '84vh', overflowY: 'auto' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-              <h2 style={{ margin: 0, fontSize: '1.15rem' }}>Insert documents</h2>
-              <button onClick={() => setIsInsertModalOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-secondary)', fontSize: '1.2rem' }}>✕</button>
+              <h2 style={{ margin: 0, fontSize: '1.15rem', color: '#f8fafc' }}>Insert documents</h2>
+              <button onClick={() => setIsInsertModalOpen(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#f8fafc', fontSize: '1.2rem' }}>✕</button>
             </div>
-            <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: 0 }}>
-              The insertion agent stores files and web pages in <code>data/uploads</code> and embeds them into ChromaDB using <strong>{agentsConfig?.insertion_agent_model || 'the configured insertion model'}</strong>. Other file types are rejected.
+            <p style={{ fontSize: '0.85rem', color: '#e2e8f0', marginTop: 0 }}>
+              The insertion agent stores files and web pages in <code style={{ color: '#bfdbfe' }}>data/uploads</code> and embeds them into ChromaDB using <strong style={{ color: '#f8fafc' }}>{agentsConfig?.insertion_agent_model || 'the configured insertion model'}</strong>. Other file types are rejected.
             </p>
-            <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+            <p style={{ fontSize: '0.78rem', color: '#cbd5e1' }}>
               Allowed: {allowedInsertExts.join(', ')}
             </p>
 
-            <input
-              ref={insertFileInputRef}
-              type="file"
-              multiple
-              accept={allowedInsertExts.join(',')}
-              style={{ display: 'none' }}
-              onChange={(e) => handleInsertFiles(e.target.files)}
-            />
-            <button
-              onClick={() => insertFileInputRef.current?.click()}
-              disabled={insertLoading}
-              style={{ padding: '0.5rem 1rem', borderRadius: '8px', fontWeight: 600, background: insertLoading ? 'var(--bg-secondary)' : 'var(--accent-color, #2563eb)', color: 'white', border: 'none', cursor: insertLoading ? 'not-allowed' : 'pointer' }}
-            >
-              {insertLoading ? 'Uploading…' : 'Choose files…'}
-            </button>
+            <div style={{ margin: '1rem 0 1.25rem', padding: '1rem', background: 'rgba(15, 23, 42, 0.85)', border: '1px solid rgba(148, 163, 184, 0.28)', borderRadius: '10px' }}>
+              <input
+                ref={insertFileInputRef}
+                type="file"
+                multiple
+                accept={allowedInsertExts.join(',')}
+                style={{ display: 'none' }}
+                onChange={(e) => handleInsertFiles(e.target.files)}
+              />
+              <button
+                onClick={() => insertFileInputRef.current?.click()}
+                disabled={insertLoading}
+                style={{ padding: '0.6rem 1.1rem', borderRadius: '8px', fontWeight: 600, background: insertLoading ? '#1e293b' : 'var(--accent-color, #2563eb)', color: '#ffffff', border: 'none', cursor: insertLoading ? 'not-allowed' : 'pointer' }}
+              >
+                {insertLoading ? insertionBusyLabel(insertLiveProgress, 'Processing…') : 'Choose files…'}
+              </button>
+            </div>
 
-            <div style={{ marginTop: '1rem', borderTop: '1px solid var(--border)', paddingTop: '1rem' }}>
-              <label style={{ display: 'block', fontSize: '0.86rem', fontWeight: 600, marginBottom: '0.35rem' }}>
+            <div style={{ marginTop: '1rem', borderTop: '1px solid var(--border)', paddingTop: '1.1rem' }}>
+              <label style={{ display: 'block', fontSize: '0.86rem', fontWeight: 600, marginBottom: '0.45rem', color: '#f8fafc' }}>
                 Insert web links
               </label>
-              <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', margin: '0 0 0.5rem 0' }}>
+              <p style={{ fontSize: '0.78rem', color: '#cbd5e1', margin: '0 0 0.65rem 0' }}>
                 Add one URL per line or separated by spaces. PDF files and HTML pages are supported.
               </p>
-              <textarea
-                className="chat-input"
+              <TextField
+                label="Web links"
                 value={insertUrls}
                 onChange={(e) => setInsertUrls(e.target.value)}
-                placeholder="https://example.com/article.html&#10;https://example.com/paper.pdf"
-                rows={3}
+                placeholder={"https://example.com/article.html\nhttps://example.com/paper.pdf"}
+                minRows={3}
+                multiline
+                fullWidth
+                size="small"
                 disabled={insertLoading}
-                style={{ width: '100%', resize: 'vertical' }}
+                helperText="Paste one or more links to insert into ChromaDB."
+                sx={{
+                  ...muiFieldSx,
+                  '& .MuiInputBase-root': {
+                    color: '#f8fafc',
+                    backgroundColor: 'rgba(2, 6, 23, 0.45)',
+                    borderRadius: '10px',
+                  },
+                  '& .MuiInputBase-input': { color: '#f8fafc' },
+                  '& .MuiInputBase-input::placeholder': { color: '#94a3b8', opacity: 1 },
+                  '& .MuiInputLabel-root': { color: '#cbd5e1' },
+                  '& .MuiInputLabel-root.Mui-focused': { color: '#bfdbfe' },
+                  '& .MuiInputLabel-root.Mui-disabled': { color: '#94a3b8' },
+                  '& .MuiInputBase-input.Mui-disabled': {
+                    color: '#e2e8f0',
+                    WebkitTextFillColor: '#e2e8f0',
+                  },
+                  '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(148, 163, 184, 0.45)' },
+                  '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(191, 219, 254, 0.7)' },
+                  '& .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: '#60a5fa' },
+                  '& .MuiFormHelperText-root': { color: '#cbd5e1', marginLeft: 0 },
+                  '& .MuiFormHelperText-root.Mui-disabled': { color: '#94a3b8' },
+                }}
               />
               <button
                 type="button"
@@ -1734,18 +1830,27 @@ export default function Home() {
                   padding: '0.5rem 1rem',
                   borderRadius: '8px',
                   fontWeight: 600,
-                  background: insertLoading || !insertUrls.trim() ? 'var(--bg-secondary)' : '#10b981',
-                  color: insertLoading || !insertUrls.trim() ? 'var(--text-secondary)' : 'white',
-                  border: '1px solid var(--border)',
+                  background: insertLoading || !insertUrls.trim() ? '#1e293b' : '#10b981',
+                  color: insertLoading || !insertUrls.trim() ? '#cbd5e1' : '#ffffff',
+                  border: '1px solid rgba(148, 163, 184, 0.35)',
                   cursor: insertLoading || !insertUrls.trim() ? 'not-allowed' : 'pointer',
                 }}
               >
-                {insertLoading ? 'Inserting…' : 'Insert links'}
+                {insertLoading ? insertionBusyLabel(insertLiveProgress, 'Processing…') : 'Insert links'}
               </button>
             </div>
 
             {insertProgress && (
-              <div style={{ fontSize: '0.85rem', marginTop: '0.75rem', color: 'var(--text-secondary)' }}>{insertProgress}</div>
+              <div style={{ fontSize: '0.85rem', marginTop: '0.75rem', color: '#e2e8f0' }}>{insertProgress}</div>
+            )}
+            {insertLiveProgress && (
+              <div style={{ marginTop: '0.55rem', padding: '0.55rem 0.65rem', borderRadius: '8px', border: '1px solid rgba(96, 165, 250, 0.35)', background: 'rgba(30, 64, 175, 0.18)', color: '#f8fafc', fontSize: '0.84rem' }}>
+                {insertionPagesComplete(insertLiveProgress) ? 'All pages processed. Embedding and storing chunks…' : 'Pages inserted so far:'} <strong>{insertLiveProgress.pagesInserted.toLocaleString()} / {insertLiveProgress.pageCount.toLocaleString()}</strong>
+                {insertLiveProgress.chars ? ` · OCR text: ${insertLiveProgress.chars.toLocaleString()} chars` : ''}
+                <div style={{ marginTop: '0.35rem', height: '6px', borderRadius: '999px', background: 'rgba(148, 163, 184, 0.25)', overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${Math.min(100, (insertLiveProgress.pagesInserted / insertLiveProgress.pageCount) * 100)}%`, background: '#60a5fa' }} />
+                </div>
+              </div>
             )}
             {insertRejected.length > 0 && (
               <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: '#fca5a5' }}>
@@ -1755,15 +1860,20 @@ export default function Home() {
             {insertResults.length > 0 && (
               <div style={{ marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
                 {insertResults.map((r, i) => (
-                  <div key={i} style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '6px', padding: '0.5rem 0.6rem', fontSize: '0.82rem' }}>
-                    <div style={{ fontWeight: 600 }}>{r.file}</div>
-                    {r.source_url && <div style={{ color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{r.source_url}</div>}
+                  <div key={i} style={{ background: 'rgba(15, 23, 42, 0.9)', border: '1px solid rgba(148, 163, 184, 0.28)', borderRadius: '8px', padding: '0.6rem 0.7rem', fontSize: '0.82rem' }}>
+                    <div style={{ fontWeight: 600, color: '#f8fafc' }}>{r.file}</div>
+                    {r.source_url && <div style={{ color: '#cbd5e1', wordBreak: 'break-all' }}>{r.source_url}</div>}
                     {r.error ? (
                       <div style={{ color: '#fca5a5' }}>Error: {r.error}</div>
                     ) : (
                       <>
-                        <div style={{ color: 'var(--text-secondary)' }}>Stored chunks: {r.stored_chunks ?? 0}{r.fallback ? ' (fallback)' : ''}</div>
-                        {r.agent_output && <div style={{ color: 'var(--text-secondary)', marginTop: '0.2rem' }}>{r.agent_output.slice(0, 260)}</div>}
+                        <div style={{ color: '#e2e8f0' }}>
+                          Stored chunks: {r.stored_chunks ?? 0}{r.fallback ? ' (fallback)' : ''}
+                          {typeof r.text_chars === 'number' ? ` · Text chars: ${r.text_chars.toLocaleString()}` : ''}
+                          {r.loader ? ` · Loader: ${r.loader}` : ''}
+                          {r.page_count ? ` · Pages inserted: ${(r.pages_inserted ?? r.page_count).toLocaleString()} / ${r.page_count.toLocaleString()}` : ''}
+                        </div>
+                        {r.agent_output && <div style={{ color: '#cbd5e1', marginTop: '0.2rem' }}>{r.agent_output.slice(0, 260)}</div>}
                       </>
                     )}
                   </div>
